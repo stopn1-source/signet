@@ -1467,7 +1467,7 @@ function extractField(text, label, nextLabels){
   return value;
 }
 
-const API_ENDPOINT = "https://jinwon.stopn1.workers.dev/";
+const API_ENDPOINT = "https://signet-kswi.onrender.com/";
 
 // 카카오 디벨로퍼스 / 네이버 디벨로퍼스에서 앱 등록 후 발급받은 값으로 바꿔주세요.
 // (시크릿 키는 여기 넣으면 안 돼요 — 그건 Worker 쪽 Secrets에만 넣는 거예요)
@@ -1475,7 +1475,7 @@ const KAKAO_CLIENT_ID = "95d1d6211c9bbcfa1ac94553fbd2d247";
 const NAVER_CLIENT_ID = "UrMShQEWIa5BoKG68NJ2";
 
 function startKakaoLogin(){
-  const redirectUri = "https://jinwon.stopn1.workers.dev/oauth/kakao/callback";
+  const redirectUri = "https://signet-kswi.onrender.com/oauth/kakao/callback";
   const authUrl = "https://kauth.kakao.com/oauth/authorize"
     + "?client_id=" + encodeURIComponent(KAKAO_CLIENT_ID)
     + "&redirect_uri=" + encodeURIComponent(redirectUri)
@@ -1484,7 +1484,7 @@ function startKakaoLogin(){
 }
 
 function startNaverLogin(){
-  const redirectUri = "https://jinwon.stopn1.workers.dev/oauth/naver/callback";
+  const redirectUri = "https://signet-kswi.onrender.com/oauth/naver/callback";
   const state = Math.random().toString(36).slice(2);
   const authUrl = "https://nid.naver.com/oauth2.0/authorize"
     + "?response_type=code"

@@ -26,7 +26,7 @@ const PAID_DAILY_LIMIT = 300;
 const GLOBAL_DAILY_LIMIT = 1000;
 
 const PAGES_URL = process.env.PAGES_URL || "https://lingering-sun-b4f9.stopn1.workers.dev";
-const BACKEND_URL = process.env.BACKEND_URL || "https://REPLACE-WITH-YOUR-RENDER-URL.onrender.com";
+const BACKEND_URL = process.env.BACKEND_URL || "https://signet-kswi.onrender.com";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
