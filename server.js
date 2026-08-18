@@ -19,7 +19,8 @@ const express = require("express");
 const cors = require("cors");
 const { Redis } = require("@upstash/redis");
 const nodeCrypto = require("crypto");
-const { subtle, getRandomValues } = nodeCrypto.webcrypto;
+const subtle = nodeCrypto.webcrypto.subtle;
+const getRandomValues = nodeCrypto.webcrypto.getRandomValues.bind(nodeCrypto.webcrypto);
 
 const FREE_DAILY_LIMIT = 30;
 const PAID_DAILY_LIMIT = 300;
