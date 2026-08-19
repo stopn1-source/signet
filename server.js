@@ -553,7 +553,9 @@ async function handleAction(body, req, res) {
         messages: body.messages,
       };
       if (body.enableSearch) {
-        anthropicBody.tools = [{ type: "web_search_20250305", name: "web_search" }];
+        // max_uses로 검색 횟수를 제한해둔다. 안 걸어두면 AI가 데이터를 찾으려고
+        // 검색을 여러 번 반복하면서 응답이 몇 분씩 걸리는 원인이 될 수 있다.
+        anthropicBody.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }];
       }
       const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
