@@ -58,6 +58,15 @@ function jsonResponse(obj, status, corsHeaders) {
   });
 }
 
+// ===== AI 호출 안전장치 (handleAction에서도 써야 해서 모듈 최상단에 둔다) =====
+const GLOBAL_DAILY_LIMIT = 1000;
+// 사용자가 body.model로 비싼 모델을 지정해 요금을 태우지 못하도록 허용 목록으로 고정
+const ALLOWED_MODELS = ["claude-sonnet-5"];
+const DEFAULT_MODEL = "claude-sonnet-5";
+const MAX_TOKENS_CAP = 8000;
+// "생성 버튼 1번"이 내부적으로 4~6회 호출되므로 넉넉히 잡는다(정상 사용으론 안 닿음)
+const RAW_CALL_DAILY_CAP = 250;
+
 export default {
   async fetch(request, env) {
     // 무료/유료 등급별 하루 사용량 한도 (원시 API 호출 기준 — 주제 추천 1번에 보통 4~5회 호출됨)
@@ -119,58 +128,9 @@ export default {
 };
 
 async function handleAction(body, request, env, APP_KV, corsHeaders, FREE_DAILY_LIMIT, PAID_DAILY_LIMIT) {
-    // ===== 회원가입 =====
-    if (body.action === "signup") {
-      const username = (body.username || "").trim();
-      const password = body.password || "";
-      const birthdate = (body.birthdate || "").trim();
-      const PASSWORD_RULE = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
-      if (username.length < 2 || username.length > 30) {
-        return jsonResponse({ error: "아이디는 2~30자로 입력해주세요." }, 400, corsHeaders);
-      }
-      if (!PASSWORD_RULE.test(password)) {
-        return jsonResponse({ error: "비밀번호는 영문 대문자·소문자·숫자·특수문자를 각각 1개 이상 포함해서 8자 이상이어야 해요." }, 400, corsHeaders);
-      }
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(birthdate) || new Date(birthdate) > new Date()) {
-        return jsonResponse({ error: "생년월일을 올바르게 입력해주세요." }, 400, corsHeaders);
-      }
-      const existing = await APP_KV.get("user:" + username);
-      if (existing) {
-        return jsonResponse({ error: "이미 사용 중인 아이디예요. 다른 아이디를 입력해주세요." }, 409, corsHeaders);
-      }
-      const { hash, salt } = await hashPassword(password);
-      await APP_KV.put("user:" + username, JSON.stringify({ hash, salt, birthdate, plan: "free", createdAt: Date.now() }));
-      return jsonResponse({ success: true }, 200, corsHeaders);
-    }
-
-    // ===== 아이디 중복확인 =====
-    if (body.action === "check_username") {
-      const checkUsername = (body.username || "").trim();
-      if (checkUsername.length < 2 || checkUsername.length > 30) {
-        return jsonResponse({ error: "아이디는 2~30자로 입력해주세요." }, 400, corsHeaders);
-      }
-      const existing = await APP_KV.get("user:" + checkUsername);
-      return jsonResponse({ success: true, available: !existing }, 200, corsHeaders);
-    }
-
-    // ===== 로그인 =====
-    if (body.action === "login") {
-      const username = (body.username || "").trim();
-      const password = body.password || "";
-      const record = await APP_KV.get("user:" + username);
-      if (!record) {
-        return jsonResponse({ error: "아이디 또는 비밀번호가 올바르지 않아요." }, 401, corsHeaders);
-      }
-      const userObj = JSON.parse(record);
-      const { hash: storedHash, salt } = userObj;
-      const { hash: attemptHash } = await hashPassword(password, salt);
-      if (attemptHash !== storedHash) {
-        return jsonResponse({ error: "아이디 또는 비밀번호가 올바르지 않아요." }, 401, corsHeaders);
-      }
-      const token = crypto.randomUUID();
-      await APP_KV.put("session:" + token, username, { expirationTtl: 2592000 }); // 30일
-      return jsonResponse({ success: true, token, username, plan: userObj.plan || "free" }, 200, corsHeaders);
-    }
+    // 아이디/비밀번호 회원가입·로그인 제거 (네이버/카카오 소셜 로그인만 사용).
+    // 화면에서만 지우고 서버에 남겨두면 서버로 직접 요청해 계정을 무한 생성할 수 있다.
+    // 아이디 중복확인은 로그인 확인 뒤로 옮겼다.
 
     // ===== 그 외: 로그인이 필요한 요청들 =====
     const authHeader = request.headers.get("Authorization") || "";
@@ -181,6 +141,16 @@ async function handleAction(body, request, env, APP_KV, corsHeaders, FREE_DAILY_
     const username = await APP_KV.get("session:" + token);
     if (!username) {
       return jsonResponse({ error: "로그인이 만료됐어요. 다시 로그인해주세요." }, 401, corsHeaders);
+    }
+
+    // ===== 아이디 중복확인 (로그인한 사용자만) =====
+    if (body.action === "check_username") {
+      const checkUsername = (body.username || "").trim();
+      if (checkUsername.length < 2 || checkUsername.length > 30) {
+        return jsonResponse({ error: "아이디는 2~30자로 입력해주세요." }, 400, corsHeaders);
+      }
+      const existing = await APP_KV.get("user:" + checkUsername);
+      return jsonResponse({ success: true, available: !existing }, 200, corsHeaders);
     }
 
     // ===== 찜하기 =====
@@ -459,26 +429,7 @@ async function handleAction(body, request, env, APP_KV, corsHeaders, FREE_DAILY_
     }
 
     // ===== 비밀번호 변경 =====
-    if (body.action === "change_password") {
-      const currentPassword = body.currentPassword || "";
-      const newPassword = body.newPassword || "";
-      const PASSWORD_RULE = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
-      const record = await APP_KV.get("user:" + username);
-      if (!record) {
-        return jsonResponse({ error: "계정 정보를 찾을 수 없어요." }, 404, corsHeaders);
-      }
-      const userObj = JSON.parse(record);
-      const { hash: attemptHash } = await hashPassword(currentPassword, userObj.salt);
-      if (attemptHash !== userObj.hash) {
-        return jsonResponse({ error: "현재 비밀번호가 올바르지 않아요." }, 401, corsHeaders);
-      }
-      if (!PASSWORD_RULE.test(newPassword)) {
-        return jsonResponse({ error: "새 비밀번호는 영문 대문자·소문자·숫자·특수문자를 각각 1개 이상 포함해서 8자 이상이어야 해요." }, 400, corsHeaders);
-      }
-      const { hash, salt } = await hashPassword(newPassword);
-      await APP_KV.put("user:" + username, JSON.stringify({ ...userObj, hash, salt }));
-      return jsonResponse({ success: true }, 200, corsHeaders);
-    }
+    // 비밀번호 변경 제거 — 소셜 로그인만 받으므로 시그넷이 보관하는 비밀번호가 없다.
 
     // ===== 과제 추가 =====
     if (body.action === "add_assignment") {
@@ -557,17 +508,40 @@ async function handleAction(body, request, env, APP_KV, corsHeaders, FREE_DAILY_
     // 전체 하루 사용량 상한 (모든 사용자 합산, 계정 도용/폭주 방지용 최후 안전장치)
     // 이건 개별 사용자 한도와 별개로, 서버 전체를 지키는 최후 방어선이라 계속 원시 호출마다 확인한다
     const today = new Date().toISOString().slice(0, 10);
+    // 요청 형태 검증 (이상하면 Anthropic에 보낼 필요도 없다)
+    if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.length > 4) {
+      return jsonResponse({ error: "요청 형식이 올바르지 않아요." }, 400, corsHeaders);
+    }
+    const totalChars = body.messages.reduce((sum, m) => sum + String((m && m.content) || "").length, 0);
+    if (totalChars > 60000) {
+      return jsonResponse({ error: "요청이 너무 길어요." }, 400, corsHeaders);
+    }
+
+    // 사용자별 원시 호출 한도. consume_usage를 건너뛰고 여기로 직접 요청해도 막히도록,
+    // AI 호출 "전에" 세고 판정한다.
+    // ⚠ 주의: Cloudflare KV에는 원자적 증가(INCR)가 없어서 이 카운터는 동시 요청에
+    //   취약하다. 실제 운영은 Render(server.js + Redis INCR) 쪽이며, 이 워커를
+    //   다시 쓰게 되면 KV 대신 Durable Object나 Redis로 카운터를 옮겨야 한다.
+    const rawCallKey = "apicalls:" + username + ":" + today;
+    const myCalls = parseInt((await APP_KV.get(rawCallKey)) || "0", 10) + 1;
+    if (myCalls > RAW_CALL_DAILY_CAP) {
+      return jsonResponse({ error: "오늘 요청이 너무 많아요. 잠시 후나 내일 다시 시도해주세요.", limitReached: true }, 429, corsHeaders);
+    }
+    await APP_KV.put(rawCallKey, String(myCalls), { expirationTtl: 172800 });
+
     const usageKey = "count:" + today;
     const current = parseInt((await APP_KV.get(usageKey)) || "0", 10);
-    const GLOBAL_DAILY_LIMIT = 1000;
     if (current >= GLOBAL_DAILY_LIMIT) {
-      return jsonResponse({ error: "오늘 전체 사용량 한도를 넘었어요. 내일 다시 시도해주세요." }, 429, corsHeaders);
+      return jsonResponse({ error: "오늘 전체 사용량 한도를 넘었어요. 내일 다시 시도해주세요.", limitReached: true }, 429, corsHeaders);
     }
 
     try {
+      // 모델과 분량은 사용자가 정하게 두지 않는다(비싼 모델 + 큰 max_tokens로 요금 태우기 방지)
+      const requestedModel = typeof body.model === "string" ? body.model : "";
+      const requestedTokens = parseInt(body.max_tokens, 10);
       const anthropicBody = {
-        model: body.model || "claude-sonnet-5",
-        max_tokens: body.max_tokens || 1000,
+        model: ALLOWED_MODELS.includes(requestedModel) ? requestedModel : DEFAULT_MODEL,
+        max_tokens: Math.min(Number.isFinite(requestedTokens) && requestedTokens > 0 ? requestedTokens : 1000, MAX_TOKENS_CAP),
         messages: body.messages,
       };
       // 실제 데이터가 필요한 요청(그래프용 데이터 등)은 검색 도구를 켜서

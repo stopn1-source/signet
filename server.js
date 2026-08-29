@@ -51,7 +51,33 @@ const APP_KV = {
   async delete(key) {
     await redis.del(key);
   },
+  // 카운터 전용 원자 연산.
+  // 예전에는 get → +1 → put 방식이라, 동시에 요청이 몰리면 전부 같은 값을 읽고
+  // 전부 한도를 통과해버렸다(사실상 한도가 없는 것과 같았다).
+  // INCR은 레디스가 한 번에 처리해줘서 몇 개가 동시에 들어와도 정확히 세어진다.
+  // 반환값이 "이번 요청까지 포함한 누적 횟수"라, 이 값으로 바로 한도를 판정한다.
+  async incr(key, ttlSeconds) {
+    const next = await redis.incr(key);
+    // 키가 막 만들어진 첫 요청에만 만료시간을 걸어둔다(매번 걸면 만료가 계속 밀린다)
+    if (next === 1 && ttlSeconds) {
+      await redis.expire(key, ttlSeconds);
+    }
+    return next;
+  },
 };
+
+// ===== AI 호출 안전장치 =====
+// 프론트엔드가 실제로 쓰는 모델만 허용한다. 사용자가 body.model로 비싼 모델을
+// 지정해서 요금을 태우는 걸 막기 위해, 목록에 없으면 무조건 기본 모델로 되돌린다.
+const ALLOWED_MODELS = ["claude-sonnet-5"];
+const DEFAULT_MODEL = "claude-sonnet-5";
+// 한 번의 호출에서 만들 수 있는 최대 분량. 프론트가 제일 크게 쓰는 값이 7000이라
+// 그보다 약간 여유를 둔 상한으로 자른다.
+const MAX_TOKENS_CAP = 8000;
+// 사용자 1명이 하루에 보낼 수 있는 원시 AI 호출 수.
+// "생성 버튼 1번"이 내부적으로 4~6번 호출되므로, 버튼 한도(FREE_DAILY_LIMIT)에
+// 넉넉히 곱한 값으로 잡는다. 정상 사용으로는 닿지 않고, 스크립트 악용만 걸린다.
+const RAW_CALL_DAILY_CAP = parseInt(process.env.RAW_CALL_DAILY_CAP || "250", 10);
 
 function bytesToHex(bytes) {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
@@ -115,58 +141,11 @@ app.post("/", async (req, res) => {
 });
 
 async function handleAction(body, req, res) {
-    // ===== 회원가입 =====
-    if (body.action === "signup") {
-      const username = (body.username || "").trim();
-      const password = body.password || "";
-      const birthdate = (body.birthdate || "").trim();
-      const PASSWORD_RULE = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
-      if (username.length < 2 || username.length > 30) {
-        return sendJson(res, { error: "아이디는 2~30자로 입력해주세요." }, 400);
-      }
-      if (!PASSWORD_RULE.test(password)) {
-        return sendJson(res, { error: "비밀번호는 영문 대문자·소문자·숫자·특수문자를 각각 1개 이상 포함해서 8자 이상이어야 해요." }, 400);
-      }
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(birthdate) || new Date(birthdate) > new Date()) {
-        return sendJson(res, { error: "생년월일을 올바르게 입력해주세요." }, 400);
-      }
-      const existing = await APP_KV.get("user:" + username);
-      if (existing) {
-        return sendJson(res, { error: "이미 사용 중인 아이디예요. 다른 아이디를 입력해주세요." }, 409);
-      }
-      const { hash, salt } = await hashPassword(password);
-      await APP_KV.put("user:" + username, JSON.stringify({ hash, salt, birthdate, plan: "free", createdAt: Date.now() }));
-      return sendJson(res, { success: true }, 200);
-    }
-
-    // ===== 아이디 중복확인 =====
-    if (body.action === "check_username") {
-      const checkUsername = (body.username || "").trim();
-      if (checkUsername.length < 2 || checkUsername.length > 30) {
-        return sendJson(res, { error: "아이디는 2~30자로 입력해주세요." }, 400);
-      }
-      const existing = await APP_KV.get("user:" + checkUsername);
-      return sendJson(res, { success: true, available: !existing }, 200);
-    }
-
-    // ===== 로그인 =====
-    if (body.action === "login") {
-      const username = (body.username || "").trim();
-      const password = body.password || "";
-      const record = await APP_KV.get("user:" + username);
-      if (!record) {
-        return sendJson(res, { error: "아이디 또는 비밀번호가 올바르지 않아요." }, 401);
-      }
-      const userObj = JSON.parse(record);
-      const { hash: storedHash, salt } = userObj;
-      const { hash: attemptHash } = await hashPassword(password, salt);
-      if (attemptHash !== storedHash) {
-        return sendJson(res, { error: "아이디 또는 비밀번호가 올바르지 않아요." }, 401);
-      }
-      const token = nodeCrypto.randomUUID();
-      await APP_KV.put("session:" + token, username, { expirationTtl: 2592000 }); // 30일
-      return sendJson(res, { success: true, token, username, plan: userObj.plan || "free" }, 200);
-    }
+    // 아이디/비밀번호 회원가입·로그인은 없앴다(네이버/카카오 소셜 로그인만 사용).
+    // 화면에서만 지우고 서버에 남겨두면, 화면을 거치지 않고 서버로 직접 요청해서
+    // 계정을 무한정 만들 수 있다 — 소셜 로그인만 받는 의미가 사라지므로 여기서도 제거한다.
+    // 아이디 중복확인(check_username)은 마이페이지의 "아이디 변경"에서만 쓰므로,
+    // 아래 로그인 확인을 통과한 뒤에 처리한다(가입자 명단이 밖으로 새지 않도록).
 
     // ===== 그 외: 로그인이 필요한 요청들 =====
     const authHeader = req.headers.authorization || "";
@@ -177,6 +156,16 @@ async function handleAction(body, req, res) {
     const username = await APP_KV.get("session:" + token);
     if (!username) {
       return sendJson(res, { error: "로그인이 만료됐어요. 다시 로그인해주세요." }, 401);
+    }
+
+    // ===== 아이디 중복확인 (로그인한 사용자만) =====
+    if (body.action === "check_username") {
+      const checkUsername = (body.username || "").trim();
+      if (checkUsername.length < 2 || checkUsername.length > 30) {
+        return sendJson(res, { error: "아이디는 2~30자로 입력해주세요." }, 400);
+      }
+      const existing = await APP_KV.get("user:" + checkUsername);
+      return sendJson(res, { success: true, available: !existing }, 200);
     }
 
     // ===== 찜하기 =====
@@ -450,27 +439,8 @@ async function handleAction(body, req, res) {
       return sendJson(res, { success: true, newUsername }, 200);
     }
 
-    // ===== 비밀번호 변경 =====
-    if (body.action === "change_password") {
-      const currentPassword = body.currentPassword || "";
-      const newPassword = body.newPassword || "";
-      const PASSWORD_RULE = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
-      const record = await APP_KV.get("user:" + username);
-      if (!record) {
-        return sendJson(res, { error: "계정 정보를 찾을 수 없어요." }, 404);
-      }
-      const userObj = JSON.parse(record);
-      const { hash: attemptHash } = await hashPassword(currentPassword, userObj.salt);
-      if (attemptHash !== userObj.hash) {
-        return sendJson(res, { error: "현재 비밀번호가 올바르지 않아요." }, 401);
-      }
-      if (!PASSWORD_RULE.test(newPassword)) {
-        return sendJson(res, { error: "새 비밀번호는 영문 대문자·소문자·숫자·특수문자를 각각 1개 이상 포함해서 8자 이상이어야 해요." }, 400);
-      }
-      const { hash, salt } = await hashPassword(newPassword);
-      await APP_KV.put("user:" + username, JSON.stringify({ ...userObj, hash, salt }));
-      return sendJson(res, { success: true }, 200);
-    }
+    // 비밀번호 변경(change_password)도 제거했다. 소셜 로그인만 받으므로 시그넷이
+    // 보관하는 비밀번호 자체가 없고(hash가 null), 화면에서도 이미 걷어냈다.
 
     // ===== 과제 추가 =====
     if (body.action === "add_assignment") {
@@ -529,13 +499,14 @@ async function handleAction(body, req, res) {
       const plan = userRecord ? (JSON.parse(userRecord).plan || "free") : "free";
       const today = new Date().toISOString().slice(0, 10);
       const userUsageKey = "usage:" + username + ":" + today;
-      const used = parseInt((await APP_KV.get(userUsageKey)) || "0", 10);
       const limit = plan === "paid" ? PAID_DAILY_LIMIT : FREE_DAILY_LIMIT;
-      if (used >= limit) {
-        return sendJson(res, { error: "오늘 무료 사용 횟수를 다 쓰셨어요. 내일 다시 이용해주시거나, 곧 열릴 유료 플랜을 기다려주세요!", plan, limitReached: true }, 429);
+      // 여기도 원자적 증가로 바꿨다. 예전 방식(읽고→+1→쓰기)은 탭 두 개에서 동시에
+      // 누르면 한 번만 차감되어 한도를 넘겨 쓸 수 있었다.
+      const used = await APP_KV.incr(userUsageKey, 172800);
+      if (used > limit) {
+        return sendJson(res, { error: "오늘 사용 횟수를 다 쓰셨어요. 내일 다시 이용해주세요.", plan, limitReached: true }, 429);
       }
-      await APP_KV.put(userUsageKey, String(used + 1), { expirationTtl: 172800 });
-      return sendJson(res, { success: true, used: used + 1, limit, remaining: Math.max(0, limit - used - 1) }, 200);
+      return sendJson(res, { success: true, used, limit, remaining: Math.max(0, limit - used) }, 200);
     }
 
     // ===== 그 외: AI 요청 처리 =====
@@ -543,17 +514,45 @@ async function handleAction(body, req, res) {
       return sendJson(res, { error: "서버에 API 키가 설정되지 않았어요. Environment에서 ANTHROPIC_API_KEY를 추가해주세요." }, 500);
     }
 
+    // 요청 형태부터 검증한다. messages가 이상하면 Anthropic에 보낼 필요도 없다.
+    if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.length > 4) {
+      return sendJson(res, { error: "요청 형식이 올바르지 않아요." }, 400);
+    }
+    const totalChars = body.messages.reduce((sum, m) => sum + String((m && m.content) || "").length, 0);
+    if (totalChars > 60000) {
+      return sendJson(res, { error: "요청이 너무 길어요." }, 400);
+    }
+
     const today = new Date().toISOString().slice(0, 10);
+
+    // (1) 사용자별 원시 호출 한도.
+    // 예전에는 이 분기에 사용자별 검사가 아예 없어서, consume_usage를 건너뛰고
+    // 여기로 직접 요청하면 무한정 호출할 수 있었다(요금이 그대로 새는 구멍).
+    // 이제는 호출 "전에" 원자적으로 1 올리고, 그 결과로 한도를 판정한다.
+    const rawCallKey = "apicalls:" + username + ":" + today;
+    const myCalls = await APP_KV.incr(rawCallKey, 172800);
+    if (myCalls > RAW_CALL_DAILY_CAP) {
+      return sendJson(res, { error: "오늘 요청이 너무 많아요. 잠시 후나 내일 다시 시도해주세요.", limitReached: true }, 429);
+    }
+
+    // (2) 전체 한도. 마찬가지로 읽고-쓰기 대신 원자적 증가로 판정한다.
+    // 예전 방식은 동시에 들어온 요청들이 전부 같은 값을 읽고 전부 통과해서,
+    // 사실상 한도가 없는 것과 같았다.
     const usageKey = "count:" + today;
-    const current = parseInt((await APP_KV.get(usageKey)) || "0", 10);
-    if (current >= GLOBAL_DAILY_LIMIT) {
-      return sendJson(res, { error: "오늘 전체 사용량 한도를 넘었어요. 내일 다시 시도해주세요." }, 429);
+    const globalCalls = await APP_KV.incr(usageKey, 172800);
+    if (globalCalls > GLOBAL_DAILY_LIMIT) {
+      return sendJson(res, { error: "오늘 전체 사용량 한도를 넘었어요. 내일 다시 시도해주세요.", limitReached: true }, 429);
     }
 
     try {
+      // 모델과 분량은 사용자가 정하게 두지 않는다.
+      // 예전에는 body.model / body.max_tokens가 그대로 전달돼서, 비싼 모델에
+      // max_tokens를 크게 걸어 요금을 태울 수 있었다.
+      const requestedModel = typeof body.model === "string" ? body.model : "";
+      const requestedTokens = parseInt(body.max_tokens, 10);
       const anthropicBody = {
-        model: body.model || "claude-sonnet-5",
-        max_tokens: body.max_tokens || 1000,
+        model: ALLOWED_MODELS.includes(requestedModel) ? requestedModel : DEFAULT_MODEL,
+        max_tokens: Math.min(Number.isFinite(requestedTokens) && requestedTokens > 0 ? requestedTokens : 1000, MAX_TOKENS_CAP),
         messages: body.messages,
       };
       if (body.enableSearch) {
@@ -571,9 +570,8 @@ async function handleAction(body, req, res) {
         },
         body: JSON.stringify(anthropicBody),
       });
-      if (anthropicResponse.ok) {
-        await APP_KV.put(usageKey, String(current + 1), { expirationTtl: 172800 });
-      }
+      // 카운터는 호출 "전에" 이미 올렸다. 실패한 호출도 세는 셈인데,
+      // 실패해도 토큰 요금이 나가는 경우가 있어서 이쪽이 안전한 방향이다.
       const data = await anthropicResponse.text();
       res.status(anthropicResponse.status).type("application/json").send(data);
       return;
