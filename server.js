@@ -413,9 +413,13 @@ async function handleAction(body, req, res) {
         return sendJson(res, { error: "계정 정보를 찾을 수 없어요." }, 404);
       }
       const userObj = JSON.parse(record);
-      const { hash: attemptHash } = await hashPassword(currentPassword, userObj.salt);
-      if (attemptHash !== userObj.hash) {
-        return sendJson(res, { error: "비밀번호가 올바르지 않아요." }, 401);
+      // 소셜 로그인(카카오/네이버) 계정은 시그넷에 저장된 비밀번호가 없다(hash가 null).
+      // 이미 로그인 토큰으로 본인 확인이 끝난 상태라, 비밀번호 검사는 건너뛴다.
+      if (userObj.hash) {
+        const { hash: attemptHash } = await hashPassword(currentPassword, userObj.salt);
+        if (attemptHash !== userObj.hash) {
+          return sendJson(res, { error: "비밀번호가 올바르지 않아요." }, 401);
+        }
       }
 
       await APP_KV.put("user:" + newUsername, JSON.stringify(userObj));
