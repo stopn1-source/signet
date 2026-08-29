@@ -1,3 +1,14 @@
+// ⚠️ 현재 이 파일은 배포되지 않는 예전 버전입니다. 실제 운영은 server.js(Render + Redis)입니다.
+//
+// server.js에는 아래 수정이 들어갔지만, 이 워커에는 Cloudflare KV의 한계로 그대로 옮기지 못했습니다:
+//   - 사용량 카운터의 원자적 증가(Redis INCR) → KV에는 없음. 동시 요청에 취약
+//   - 아이디 변경 시 새 아이디 선점(SET NX) → KV에는 없음
+//   - 사용자별 세션 목록(Redis Set) → KV에는 없음. 로그아웃/탈퇴 시 다른 기기 세션 정리 불가
+//   - 아이디 변경 시 oauth: 연결고리 이동, 회원 탈퇴 기능 → 미반영
+//
+// 이 워커를 다시 쓰려면 카운터와 세션을 Durable Objects나 Redis로 옮긴 뒤에
+// server.js의 로직을 그대로 가져와야 합니다. 지금 상태로 배포하면 안 됩니다.
+//
 // 시그넷(Signet) 백엔드 — Cloudflare Worker
 //
 // 주요 action:

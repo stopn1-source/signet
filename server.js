@@ -64,6 +64,25 @@ const APP_KV = {
     }
     return next;
   },
+  // "아직 없을 때만" 값을 넣는다. 성공하면 true.
+  // 아이디 변경에서 새 아이디를 선점할 때 쓴다 — 조회 후 저장 방식이면
+  // 두 사람이 동시에 같은 아이디로 바꿀 때 둘 다 통과해서 한쪽 계정이 사라진다.
+  async setIfAbsent(key, value) {
+    const ok = await redis.set(key, value, { nx: true });
+    return ok !== null;
+  },
+  // 한 사용자의 로그인 세션 토큰 목록. 로그아웃·아이디 변경·회원 탈퇴에서
+  // "이 사람의 모든 기기 세션"을 다뤄야 해서 따로 모아둔다.
+  async addSession(username, token) {
+    await redis.sadd("sessions:" + username, token);
+  },
+  async listSessions(username) {
+    const arr = await redis.smembers("sessions:" + username);
+    return Array.isArray(arr) ? arr : [];
+  },
+  async dropSessionIndex(username) {
+    await redis.del("sessions:" + username);
+  },
 };
 
 // ===== AI 호출 안전장치 =====
@@ -156,6 +175,65 @@ async function handleAction(body, req, res) {
     const username = await APP_KV.get("session:" + token);
     if (!username) {
       return sendJson(res, { error: "로그인이 만료됐어요. 다시 로그인해주세요." }, 401);
+    }
+
+    // ===== 로그아웃 =====
+    // 예전에는 브라우저에 저장된 토큰만 지웠고 서버의 세션은 30일간 그대로 살아있었다.
+    // 학교 컴퓨터 같은 공용 기기에서는 그 토큰이 계속 유효해서 위험하다.
+    if (body.action === "logout") {
+      await APP_KV.delete("session:" + token);
+      const rest = (await APP_KV.listSessions(username)).filter(t => t !== token);
+      await APP_KV.dropSessionIndex(username);
+      for (const t of rest) {
+        await APP_KV.addSession(username, t);
+      }
+      return sendJson(res, { success: true }, 200);
+    }
+
+    // ===== 회원 탈퇴 (계정과 관련 데이터를 모두 지운다) =====
+    // 개인정보 파기 요구를 위해서도 필요하고, 사용자가 스스로 정리할 수 있어야 한다.
+    if (body.action === "delete_account") {
+      const record = await APP_KV.get("user:" + username);
+      const userObj = record ? JSON.parse(record) : {};
+
+      // 게시판 글·답글은 먼저 지운다(남겨두면 탈퇴한 사람 이름이 계속 노출된다)
+      const postsRaw = await APP_KV.get("posts");
+      if (postsRaw) {
+        let posts = JSON.parse(postsRaw);
+        posts = posts.filter(p => p.username !== username);
+        posts.forEach(p => {
+          p.replies = (p.replies || []).filter(r => r.username !== username);
+        });
+        await APP_KV.put("posts", JSON.stringify(posts));
+      }
+
+      // 소셜 로그인 연결고리 삭제 — 안 지우면 같은 소셜 계정으로 다시 로그인했을 때
+      // 사라진 옛 아이디로 연결되어 버린다
+      if (userObj.oauthProvider && userObj.oauthId) {
+        await APP_KV.delete("oauth:" + userObj.oauthProvider + ":" + userObj.oauthId);
+      }
+
+      // 모든 기기의 세션 무효화
+      for (const t of await APP_KV.listSessions(username)) {
+        await APP_KV.delete("session:" + t);
+      }
+      await APP_KV.delete("session:" + token);
+      await APP_KV.dropSessionIndex(username);
+
+      // 개인 데이터 삭제
+      const todayForDelete = new Date().toISOString().slice(0, 10);
+      for (const key of [
+        "fav:" + username,
+        "hist:" + username,
+        "assign:" + username,
+        "usage:" + username + ":" + todayForDelete,
+        "apicalls:" + username + ":" + todayForDelete,
+        "user:" + username,
+      ]) {
+        await APP_KV.delete(key);
+      }
+
+      return sendJson(res, { success: true }, 200);
     }
 
     // ===== 아이디 중복확인 (로그인한 사용자만) =====
@@ -393,10 +471,6 @@ async function handleAction(body, req, res) {
       if (newUsername === username) {
         return sendJson(res, { error: "지금 아이디랑 같아요." }, 400);
       }
-      const existingNew = await APP_KV.get("user:" + newUsername);
-      if (existingNew) {
-        return sendJson(res, { error: "이미 사용 중인 아이디예요." }, 409);
-      }
       const record = await APP_KV.get("user:" + username);
       if (!record) {
         return sendJson(res, { error: "계정 정보를 찾을 수 없어요." }, 404);
@@ -411,7 +485,20 @@ async function handleAction(body, req, res) {
         }
       }
 
-      await APP_KV.put("user:" + newUsername, JSON.stringify(userObj));
+      // 소셜 계정인데 oauthId가 없으면(예전에 가입한 계정) 지금 아이디를 바꾸면
+      // oauth 연결고리가 옛 이름을 가리킨 채 남아서, 다음 로그인 때 계정이 통째로
+      // 사라진 것처럼 보인다. 그래서 바꾸지 않고, 다시 로그인하도록 안내한다.
+      // (다시 로그인하면 oauthId가 자동으로 채워져서 그 뒤엔 정상 동작한다)
+      if (userObj.oauthProvider && !userObj.oauthId) {
+        return sendJson(res, { error: "계정 정보를 갱신해야 해요. 로그아웃했다가 다시 로그인한 뒤에 시도해주세요." }, 409);
+      }
+
+      // 새 아이디는 "없을 때만 넣기"로 선점한다. 조회 후 저장 방식이면 두 사람이
+      // 동시에 같은 아이디로 바꿀 때 둘 다 통과해서 한쪽 계정이 덮어써진다.
+      const claimed = await APP_KV.setIfAbsent("user:" + newUsername, JSON.stringify(userObj));
+      if (!claimed) {
+        return sendJson(res, { error: "이미 사용 중인 아이디예요." }, 409);
+      }
       await APP_KV.delete("user:" + username);
 
       for (const prefix of ["fav:", "hist:", "assign:"]) {
@@ -420,6 +507,24 @@ async function handleAction(body, req, res) {
           await APP_KV.put(prefix + newUsername, dataRaw);
           await APP_KV.delete(prefix + username);
         }
+      }
+
+      // 오늘 쓴 사용량도 같이 옮긴다. 안 옮기면 아이디만 바꿔서 한도를 초기화할 수 있다.
+      const todayForMove = new Date().toISOString().slice(0, 10);
+      for (const usageKeyName of ["usage:", "apicalls:"]) {
+        const oldKey = usageKeyName + username + ":" + todayForMove;
+        const val = await APP_KV.get(oldKey);
+        if (val) {
+          await APP_KV.put(usageKeyName + newUsername + ":" + todayForMove, val, { expirationTtl: 172800 });
+          await APP_KV.delete(oldKey);
+        }
+      }
+
+      // 소셜 로그인 연결고리를 새 아이디로 옮긴다.
+      // 이걸 빠뜨리면 다음 로그인 때 사라진 옛 아이디로 로그인되어 데이터가 안 보이고,
+      // 비워진 옛 아이디를 다른 사람이 차지하면 그 사람 계정으로 들어가버린다.
+      if (userObj.oauthProvider && userObj.oauthId) {
+        await APP_KV.put("oauth:" + userObj.oauthProvider + ":" + userObj.oauthId, newUsername);
       }
 
       const postsRaw = await APP_KV.get("posts");
@@ -434,7 +539,15 @@ async function handleAction(body, req, res) {
         await APP_KV.put("posts", JSON.stringify(posts));
       }
 
-      await APP_KV.put("session:" + token, newUsername, { expirationTtl: 2592000 });
+      // 다른 기기에 남아있는 세션들도 새 아이디를 가리키게 한다.
+      // 안 그러면 그 기기들은 사라진 옛 아이디로 요청하게 된다.
+      const myTokens = await APP_KV.listSessions(username);
+      const allTokens = myTokens.includes(token) ? myTokens : myTokens.concat([token]);
+      for (const t of allTokens) {
+        await APP_KV.put("session:" + t, newUsername, { expirationTtl: 2592000 });
+        await APP_KV.addSession(newUsername, t);
+      }
+      await APP_KV.dropSessionIndex(username);
 
       return sendJson(res, { success: true, newUsername }, 200);
     }
@@ -608,6 +721,8 @@ async function handleOAuthCallback(provider, req, res) {
     const username = await findOrCreateOAuthUser(provider, String(profile.id), profile.nickname);
     const token = nodeCrypto.randomUUID();
     await APP_KV.put("session:" + token, username, { expirationTtl: 2592000 });
+    // 이 사람의 세션 목록에도 넣어둔다(로그아웃·아이디 변경·탈퇴에서 필요)
+    await APP_KV.addSession(username, token);
 
     return res.redirect(
       302,
@@ -676,6 +791,15 @@ async function findOrCreateOAuthUser(provider, socialId, nicknameHint) {
   const linkKey = "oauth:" + provider + ":" + socialId;
   const existingUsername = await APP_KV.get(linkKey);
   if (existingUsername) {
+    // 예전에 가입한 계정에는 oauthId가 없다. 아이디를 바꿀 때 이 연결고리를
+    // 같이 옮겨야 하는데, 없으면 계정이 깨지므로 로그인하는 김에 채워둔다.
+    const recRaw = await APP_KV.get("user:" + existingUsername);
+    if (recRaw) {
+      const rec = JSON.parse(recRaw);
+      if (!rec.oauthId) {
+        await APP_KV.put("user:" + existingUsername, JSON.stringify({ ...rec, oauthProvider: provider, oauthId: socialId }));
+      }
+    }
     return existingUsername;
   }
 
@@ -692,7 +816,8 @@ async function findOrCreateOAuthUser(provider, socialId, nicknameHint) {
 
   await APP_KV.put(
     "user:" + username,
-    JSON.stringify({ hash: null, salt: null, plan: "free", createdAt: Date.now(), oauthProvider: provider })
+    // oauthId까지 남겨야 나중에 아이디를 바꿀 때 oauth: 연결고리를 찾아 옮길 수 있다
+    JSON.stringify({ hash: null, salt: null, plan: "free", createdAt: Date.now(), oauthProvider: provider, oauthId: socialId })
   );
   await APP_KV.put(linkKey, username);
   return username;
