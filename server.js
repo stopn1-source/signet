@@ -591,7 +591,7 @@ async function handleAction(body, req, res) {
         id: rm.id,
         title: (rm.thread || {}).title || "제목 없는 로드맵",
         career: rm.career || "",
-        track: rm.track || "",
+        track: rm.track || (rm.trackBroad ? "전공 전체를 폭넓게" : ""),
         grade: rm.grade || "",
         subjectCount: subs.length,
         doneCount: subs.filter(x => x.status === "done").length,
@@ -615,6 +615,8 @@ async function handleAction(body, req, res) {
         id: existing ? existing.id : ("rm" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
         career: String(roadmap.career || "").slice(0, 100),
         track: String(roadmap.track || "").slice(0, 100),
+        // 학생이 일부러 "폭넓게"를 고른 것과, 그냥 안 적은 것은 다르게 다뤄야 해서 따로 기록한다
+        trackBroad: !!roadmap.trackBroad,
         interest: String(roadmap.interest || "").slice(0, 100),
         grade: String(roadmap.grade || "").slice(0, 20),
         thread: {
