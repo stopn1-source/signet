@@ -596,6 +596,7 @@ async function handleAction(body, req, res) {
         subjectCount: subs.length,
         doneCount: subs.filter(x => x.status === "done").length,
         topicCount: subs.reduce((n, x) => n + ((x.topics || []).length), 0),
+        pinned: !!rm.pinned,
         updatedAt: rm.updatedAt || 0
       };
     }
@@ -627,6 +628,8 @@ async function handleAction(body, req, res) {
           phase: String(sq.phase || "").slice(0, 60),
           what: String(sq.what || "").slice(0, 600)
         })),
+        // 찜은 사용자가 누른 값이라, 로드맵을 다시 만들어도 그대로 둔다
+        pinned: existing ? !!existing.pinned : false,
         subjects: roadmap.subjects.slice(0, 18).map((sub, idx) => {
           // 이미 저장돼 있던 항목이면 거기 담아둔 주제들은 살려둔다
           const prev = existing ? (existing.subjects || []).find(x => x.id === sub.id) : null;
@@ -668,7 +671,10 @@ async function handleAction(body, req, res) {
       if (!list.length) return sendJson(res, { success: true, roadmap: null, roadmaps: [] }, 200);
       const wanted = String(body.id || "");
       const found = wanted ? list.find(x => x.id === wanted) : null;
-      const pick = found || list.slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+      // 찜해둔 로드맵이 있으면 그게 먼저 열린다. 없으면 가장 최근에 손댄 것.
+      const pinned = list.find(x => x.pinned);
+      const latest = list.slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+      const pick = found || pinned || latest;
       return sendJson(res, { success: true, roadmap: pick || null, roadmaps: list.map(roadmapSummary) }, 200);
     }
 
@@ -733,6 +739,21 @@ async function handleAction(body, req, res) {
       rm.updatedAt = Date.now();
       await saveRoadmaps(list);
       return sendJson(res, { success: true, roadmap: rm }, 200);
+    }
+
+    // ===== 로드맵 찜하기 =====
+    // 여러 개를 보관하다 보면 "지금 내가 따라가는 계획"이 뭔지 흐려져요.
+    // 찜해두면 로드맵 화면에 들어올 때 그게 먼저 열립니다. 찜은 하나만 됩니다.
+    if (body.action === "pin_roadmap") {
+      const wanted = String(body.id || "");
+      const list = await loadRoadmaps();
+      const target = list.find(x => x.id === wanted);
+      if (!target) return sendJson(res, { error: "해당 로드맵을 찾을 수 없어요." }, 404);
+      const turningOn = !target.pinned;
+      list.forEach(x => { x.pinned = false; });
+      target.pinned = turningOn;
+      await saveRoadmaps(list);
+      return sendJson(res, { success: true, pinned: turningOn, roadmaps: list.map(roadmapSummary) }, 200);
     }
 
     // ===== 생기부 로드맵 삭제 =====
