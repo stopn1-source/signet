@@ -226,6 +226,7 @@ async function handleAction(body, req, res) {
         "fav:" + username,
         "hist:" + username,
         "assign:" + username,
+        "roadmap:" + username,
         "usage:" + username + ":" + todayForDelete,
         "apicalls:" + username + ":" + todayForDelete,
         "user:" + username,
@@ -501,7 +502,7 @@ async function handleAction(body, req, res) {
       }
       await APP_KV.delete("user:" + username);
 
-      for (const prefix of ["fav:", "hist:", "assign:"]) {
+      for (const prefix of ["fav:", "hist:", "assign:", "roadmap:"]) {
         const dataRaw = await APP_KV.get(prefix + username);
         if (dataRaw) {
           await APP_KV.put(prefix + newUsername, dataRaw);
@@ -554,6 +555,75 @@ async function handleAction(body, req, res) {
 
     // 비밀번호 변경(change_password)도 제거했다. 소셜 로그인만 받으므로 시그넷이
     // 보관하는 비밀번호 자체가 없고(hash가 null), 화면에서도 이미 걷어냈다.
+
+    // ===== 생기부 로드맵 저장 =====
+    // 로드맵은 사용자당 하나만 둔다. 여러 개를 관리하게 하면 오히려 복잡해지고,
+    // 학생 입장에서도 "내 생기부 계획"은 하나인 게 자연스럽다.
+    if (body.action === "save_roadmap") {
+      const roadmap = body.roadmap;
+      if (!roadmap || !roadmap.thread || !Array.isArray(roadmap.subjects)) {
+        return sendJson(res, { error: "저장할 로드맵 정보가 없어요." }, 400);
+      }
+      // 통째로 받은 걸 그대로 저장하지 않고, 쓸 항목만 골라 담는다.
+      // 안 그러면 임의의 큰 데이터가 그대로 저장될 수 있다.
+      const clean = {
+        career: String(roadmap.career || "").slice(0, 100),
+        interest: String(roadmap.interest || "").slice(0, 100),
+        grade: String(roadmap.grade || "").slice(0, 20),
+        thread: {
+          title: String((roadmap.thread || {}).title || "").slice(0, 200),
+          why: String((roadmap.thread || {}).why || "").slice(0, 1000)
+        },
+        sequence: (roadmap.sequence || []).slice(0, 6).map(sq => ({
+          phase: String(sq.phase || "").slice(0, 60),
+          what: String(sq.what || "").slice(0, 600)
+        })),
+        subjects: roadmap.subjects.slice(0, 12).map((sub, idx) => ({
+          id: String(sub.id || ("s" + idx)).slice(0, 40),
+          subject: String(sub.subject || "").slice(0, 60),
+          angle: String(sub.angle || "").slice(0, 600),
+          topicIdea: String(sub.topicIdea || "").slice(0, 600),
+          connectsTo: String(sub.connectsTo || "").slice(0, 400),
+          status: ["todo", "doing", "done"].includes(sub.status) ? sub.status : "todo"
+        })),
+        updatedAt: Date.now()
+      };
+      await APP_KV.put("roadmap:" + username, JSON.stringify(clean));
+      return sendJson(res, { success: true, roadmap: clean }, 200);
+    }
+
+    // ===== 생기부 로드맵 불러오기 =====
+    if (body.action === "get_roadmap") {
+      const raw = await APP_KV.get("roadmap:" + username);
+      return sendJson(res, { success: true, roadmap: raw ? JSON.parse(raw) : null }, 200);
+    }
+
+    // ===== 로드맵 항목 진행 상태 변경 =====
+    if (body.action === "update_roadmap_status") {
+      const itemId = String(body.itemId || "");
+      const status = body.status;
+      if (!["todo", "doing", "done"].includes(status)) {
+        return sendJson(res, { error: "상태 값이 올바르지 않아요." }, 400);
+      }
+      const raw = await APP_KV.get("roadmap:" + username);
+      if (!raw) {
+        return sendJson(res, { error: "저장된 로드맵이 없어요." }, 404);
+      }
+      const roadmap = JSON.parse(raw);
+      const target = (roadmap.subjects || []).find(sub => sub.id === itemId);
+      if (!target) {
+        return sendJson(res, { error: "해당 항목을 찾을 수 없어요." }, 404);
+      }
+      target.status = status;
+      await APP_KV.put("roadmap:" + username, JSON.stringify(roadmap));
+      return sendJson(res, { success: true }, 200);
+    }
+
+    // ===== 생기부 로드맵 삭제 =====
+    if (body.action === "delete_roadmap") {
+      await APP_KV.delete("roadmap:" + username);
+      return sendJson(res, { success: true }, 200);
+    }
 
     // ===== 과제 추가 =====
     if (body.action === "add_assignment") {
