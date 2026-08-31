@@ -568,6 +568,7 @@ async function handleAction(body, req, res) {
       // 안 그러면 임의의 큰 데이터가 그대로 저장될 수 있다.
       const clean = {
         career: String(roadmap.career || "").slice(0, 100),
+        track: String(roadmap.track || "").slice(0, 100),
         interest: String(roadmap.interest || "").slice(0, 100),
         grade: String(roadmap.grade || "").slice(0, 20),
         thread: {
@@ -581,6 +582,10 @@ async function handleAction(body, req, res) {
         subjects: roadmap.subjects.slice(0, 12).map((sub, idx) => ({
           id: String(sub.id || ("s" + idx)).slice(0, 40),
           subject: String(sub.subject || "").slice(0, 60),
+          // 한눈에 보기 도형에 들어가는 값들 — 어느 시기 칸에 놓을지, 칸 안에 뭐라고 쓸지
+          phaseNo: Math.min(9, Math.max(0, parseInt(sub.phaseNo, 10) || 0)),
+          phase: String(sub.phase || "").slice(0, 60),
+          short: String(sub.short || "").slice(0, 40),
           angle: String(sub.angle || "").slice(0, 600),
           topicIdea: String(sub.topicIdea || "").slice(0, 600),
           connectsTo: String(sub.connectsTo || "").slice(0, 400),
