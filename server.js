@@ -309,6 +309,44 @@ async function handleAction(body, req, res) {
       list.unshift(entry);
       const trimmed = list.slice(0, 100); // 최근 100개까지만 보관
       await APP_KV.put("hist:" + username, JSON.stringify(trimmed));
+      // id를 돌려줘야, 탭을 열어 내용이 채워졌을 때 이 항목을 찾아 갱신할 수 있다
+      return sendJson(res, { success: true, id: entry.id }, 200);
+    }
+
+    // ===== 저장된 주제에 뒤늦게 받은 내용 채워 넣기 =====
+    // 주제를 받은 직후에는 개요만 있고, 탐구내용·참고자료·뉴스는 탭을 열어야 만들어진다.
+    // 그래서 저장은 개요만 된 채로 남아 있었고, 나중에 찜/기록에서 열면 텅 비어 보였다.
+    // 탭이 열릴 때마다 여기로 보내서 저장된 항목을 채운다.
+    if (body.action === "update_saved_topic") {
+      const scope = body.scope === "favorite" ? "fav" : "hist";
+      const id = String(body.id || "");
+      const patch = body.patch;
+      if (!id || !patch || typeof patch !== "object") {
+        return sendJson(res, { error: "채워 넣을 내용이 없어요." }, 400);
+      }
+      // 아무 값이나 덮어쓰지 않도록, 뒤늦게 채워질 수 있는 항목만 받는다
+      const ALLOWED = ["content", "motivation", "formulaPart", "curriculum", "materials", "raw", "news"];
+      const clean = {};
+      for (const key of ALLOWED) {
+        if (patch[key] === undefined) continue;
+        const val = patch[key];
+        if (typeof val === "string") clean[key] = val.slice(0, 20000);
+        else if (val && typeof val === "object") {
+          const asText = JSON.stringify(val);
+          if (asText.length <= 60000) clean[key] = val;
+        }
+      }
+      if (!Object.keys(clean).length) {
+        return sendJson(res, { error: "채워 넣을 내용이 없어요." }, 400);
+      }
+      const listRaw = await APP_KV.get(scope + ":" + username);
+      const list = listRaw ? JSON.parse(listRaw) : [];
+      const target = list.find(x => x.id === id);
+      if (!target) {
+        return sendJson(res, { error: "저장된 주제를 찾을 수 없어요." }, 404);
+      }
+      Object.assign(target, clean);
+      await APP_KV.put(scope + ":" + username, JSON.stringify(list));
       return sendJson(res, { success: true }, 200);
     }
 
