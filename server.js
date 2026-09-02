@@ -657,6 +657,8 @@ async function handleAction(body, req, res) {
         // 학생이 일부러 "폭넓게"를 고른 것과, 그냥 안 적은 것은 다르게 다뤄야 해서 따로 기록한다
         trackBroad: !!roadmap.trackBroad,
         interest: String(roadmap.interest || "").slice(0, 100),
+        // 이미 해둔 탐구·활동 (다시 만들 때 그대로 되살리려고 같이 보관해요)
+        done: String(roadmap.done || "").slice(0, 600),
         grade: String(roadmap.grade || "").slice(0, 20),
         thread: {
           title: String((roadmap.thread || {}).title || "").slice(0, 200),
