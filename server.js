@@ -98,6 +98,109 @@ const MAX_TOKENS_CAP = 8000;
 // 넉넉히 곱한 값으로 잡는다. 정상 사용으로는 닿지 않고, 스크립트 악용만 걸린다.
 const RAW_CALL_DAILY_CAP = parseInt(process.env.RAW_CALL_DAILY_CAP || "250", 10);
 
+// 검색 횟수 상한. 검색 결과가 통째로 입력 토큰에 실려서, 이 숫자가 원가에 직접 영향을 준다.
+// 3 → 2로 낮추면 주제 1건당 60원쯤 줄어든다. Render 환경변수로 조절할 수 있게 빼둔다.
+const WEB_SEARCH_MAX_USES = Math.min(5, Math.max(1, parseInt(process.env.WEB_SEARCH_MAX_USES || "3", 10)));
+
+// ============================================================
+// 응답 캐시 — 같은 질문에 같은 답이 나와야 정상인 호출만 재사용한다
+//
+// AI 호출은 쓸수록 돈이 나간다. 그런데 시그넷의 호출 중 상당수는
+// "같은 입력이면 같은 답이 나와야 맞는" 것들이다.
+//   · 화학공학과 안에 어떤 세부 분야가 있는지 → 학생마다 달라야 할 이유가 없다
+//   · 이 주제가 교과서 어느 단원과 이어지는지 → 주제가 같으면 단원도 같다
+//   · 관련 뉴스, 참고도서, 수식 설명          → 마찬가지
+// 한 번 만들어두고 다시 쓰면 요금이 0원이고, 응답도 기다림 없이 바로 나간다.
+//
+// 반대로 절대 재사용하면 안 되는 것도 있다.
+//   · 탐구 주제 추천 → 같은 조건의 두 학생에게 같은 주제가 나가면 생기부가 겹친다
+//   · 3년 로드맵     → 친구랑 계획이 똑같으면 서비스를 믿지 않게 된다
+//
+// 그래서 캐시해도 되는 종류를 프론트가 cacheType으로 알려주고, 서버는 그 이름이
+// 허용 목록에 있을 때만 여럿이 나눠 쓰는 캐시에 넣는다. 키는 서버가 프롬프트
+// 내용으로 직접 만들기 때문에 클라이언트가 조작할 수 없다.
+// ============================================================
+
+const CACHE_TTL = {
+  tracks:     60 * 60 * 24 * 180, // 학과 안의 세부 분야 — 학과 목록이 유한해서 곧 전부 캐시된다
+  glossary:   60 * 60 * 24 * 90,  // 용어 풀이
+  curriculum: 60 * 60 * 24 * 60,  // 교육과정 연계
+  materials:  60 * 60 * 24 * 60,  // 참고자료(전공서적·교양서)
+  formula:    60 * 60 * 24 * 60,  // 수식 설명
+  graphs:     60 * 60 * 24 * 30,  // 수식표·그래프 (웹검색이 붙어 제일 비싼 호출)
+  content:    60 * 60 * 24 * 30,  // 탐구내용 세 덩어리
+  interview:  60 * 60 * 24 * 30,  // 면접 예상질문
+  news:       60 * 60 * 24 * 7,   // 뉴스 연계 — 시의성이 있어 짧게
+};
+
+// 프롬프트에 이 말이 들어 있으면 종류와 상관없이 캐시하지 않는다.
+// 프론트가 실수로 cacheType을 잘못 붙여도 주제·로드맵이 재사용되는 사고를 막는다.
+const NEVER_CACHE_MARKERS = [
+  "이미 이전에 추천한 주제야",
+  "정확히 1개만 추천",
+  "3년 전체 계획",
+  "관통하는",
+];
+
+const CACHE_MAX_CHARS = 200000; // 너무 큰 응답은 저장소만 잡아먹으니 건너뛴다
+
+function aiCacheKey(anthropicBody) {
+  const h = nodeCrypto.createHash("sha256").update(JSON.stringify({
+    m: anthropicBody.model,
+    t: anthropicBody.max_tokens,
+    s: !!anthropicBody.tools,
+    x: anthropicBody.messages,
+  })).digest("hex");
+  return h;
+}
+
+// 프롬프트에 재사용 금지 표시가 있는지
+function isNeverCacheable(messages) {
+  const text = messages.map(m => String((m && m.content) || "")).join("\n");
+  return NEVER_CACHE_MARKERS.some(marker => text.includes(marker));
+}
+
+// 여럿이 나눠 쓰는 캐시의 보관 기간. null이면 공유 캐시를 쓰지 않는다.
+function sharedCacheTtl(cacheType, messages) {
+  const type = typeof cacheType === "string" ? cacheType : "";
+  if (!Object.prototype.hasOwnProperty.call(CACHE_TTL, type)) return null;
+  if (isNeverCacheable(messages)) return null;
+  return CACHE_TTL[type];
+}
+
+// 토큰 사용량을 달 단위로 쌓아둔다.
+// 지금까지 원가는 프롬프트 길이로 추정한 값이었다. 실측이 있어야 가격을 자신 있게
+// 정할 수 있어서, 응답에 들어오는 usage를 그대로 기록한다.
+// 기록이 실패해도 사용자 요청은 그대로 진행시킨다.
+async function recordTokenUsage(username, payloadText, fromCache) {
+  try {
+    const month = new Date().toISOString().slice(0, 7);
+    const parsed = JSON.parse(payloadText);
+    const u = (parsed && parsed.usage) || {};
+    const inTok = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+    const outTok = u.output_tokens || 0;
+    const searches = ((u.server_tool_use) || {}).web_search_requests || 0;
+    // 캐시로 아낀 양은 따로 센다 — 캐시가 실제로 얼마나 일하는지 보려고
+    const fields = fromCache
+      ? { hits: 1, saved_in: inTok, saved_out: outTok, saved_searches: searches }
+      : { calls: 1, in: inTok, out: outTok, searches: searches };
+    for (const [field, value] of Object.entries(fields)) {
+      if (!value) continue;
+      await redis.hincrby("tok:" + month, field, value);
+      await redis.hincrby("tok:" + month + ":" + username, field, value);
+    }
+    await redis.expire("tok:" + month + ":" + username, 60 * 60 * 24 * 400);
+  } catch (e) {
+    // 사용량 기록은 부가 기능이라 조용히 넘어간다
+  }
+}
+
+// 100만 토큰당 단가 (claude-sonnet-5 기준). 요금이 바뀌면 여기만 고치면 된다.
+const PRICE_IN_PER_MTOK = 2;
+const PRICE_OUT_PER_MTOK = 10;
+const PRICE_PER_SEARCH = 0.01;
+
+
 function bytesToHex(bytes) {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
@@ -874,6 +977,29 @@ async function handleAction(body, req, res) {
       return sendJson(res, { success: true, used, limit, remaining: Math.max(0, limit - used) }, 200);
     }
 
+    // ===== 이번 달 토큰 사용량과 예상 요금 =====
+    // 추정이 아니라 실제로 쓴 양을 보여준다. 캐시가 얼마나 아껴줬는지도 함께.
+    if (body.action === "get_cost") {
+      const month = new Date().toISOString().slice(0, 7);
+      const mine = (await redis.hgetall("tok:" + month + ":" + username)) || {};
+      const all = (await redis.hgetall("tok:" + month)) || {};
+      const num = (o, k) => parseInt(o[k] || "0", 10);
+      const cost = o =>
+        num(o, "in") * PRICE_IN_PER_MTOK / 1e6 +
+        num(o, "out") * PRICE_OUT_PER_MTOK / 1e6 +
+        num(o, "searches") * PRICE_PER_SEARCH;
+      const saved = o =>
+        num(o, "saved_in") * PRICE_IN_PER_MTOK / 1e6 +
+        num(o, "saved_out") * PRICE_OUT_PER_MTOK / 1e6 +
+        num(o, "saved_searches") * PRICE_PER_SEARCH;
+      return sendJson(res, {
+        success: true,
+        month,
+        me: { calls: num(mine, "calls"), cacheHits: num(mine, "hits"), inputTokens: num(mine, "in"), outputTokens: num(mine, "out"), usd: +cost(mine).toFixed(4), savedUsd: +saved(mine).toFixed(4) },
+        total: { calls: num(all, "calls"), cacheHits: num(all, "hits"), inputTokens: num(all, "in"), outputTokens: num(all, "out"), usd: +cost(all).toFixed(4), savedUsd: +saved(all).toFixed(4) },
+      }, 200);
+    }
+
     // ===== 그 외: AI 요청 처리 =====
     if (!process.env.ANTHROPIC_API_KEY) {
       return sendJson(res, { error: "서버에 API 키가 설정되지 않았어요. Environment에서 ANTHROPIC_API_KEY를 추가해주세요." }, 500);
@@ -890,19 +1016,53 @@ async function handleAction(body, req, res) {
 
     const today = new Date().toISOString().slice(0, 10);
 
+    // 보낼 내용을 먼저 확정한다. 캐시 키를 이 내용으로 만들기 때문에,
+    // 사용자가 model이나 max_tokens를 바꿔 보내도 키가 갈라질 뿐 남의 캐시를 건드리지 못한다.
+    const requestedModel = typeof body.model === "string" ? body.model : "";
+    const requestedTokens = parseInt(body.max_tokens, 10);
+    const anthropicBody = {
+      model: ALLOWED_MODELS.includes(requestedModel) ? requestedModel : DEFAULT_MODEL,
+      max_tokens: Math.min(Number.isFinite(requestedTokens) && requestedTokens > 0 ? requestedTokens : 1000, MAX_TOKENS_CAP),
+      messages: body.messages,
+    };
+    if (body.enableSearch) {
+      // max_uses로 검색 횟수를 제한해둔다. 안 걸어두면 AI가 데이터를 찾으려고
+      // 검색을 반복하면서 응답이 몇 분씩 걸리고 입력 토큰도 그만큼 불어난다.
+      anthropicBody.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }];
+    }
+
+    // ── (0) 캐시부터 본다. 맞으면 API를 아예 부르지 않는다 ──
+    const hash = aiCacheKey(anthropicBody);
+    const sharedKey = "aic:" + hash;                       // 모두가 나눠 쓰는 캐시
+    const selfKey = "aiself:" + username + ":" + hash;     // 같은 사람이 같은 요청을 다시 보낸 경우
+    const sharedTtl = sharedCacheTtl(body.cacheType, body.messages);
+    const neverCache = isNeverCacheable(body.messages);
+
+    let cached = null;
+    if (sharedTtl) cached = await APP_KV.get(sharedKey);
+    if (!cached && !neverCache) cached = await APP_KV.get(selfKey);
+
+    if (cached) {
+      // 캐시는 요금이 안 나가지만, 무한정 두드리는 것도 막아야 하니 넉넉한 상한을 둔다
+      const hits = await APP_KV.incr("aihit:" + username + ":" + today, 172800);
+      if (hits > RAW_CALL_DAILY_CAP * 5) {
+        return sendJson(res, { error: "오늘 요청이 너무 많아요. 잠시 후 다시 시도해주세요.", limitReached: true }, 429);
+      }
+      await recordTokenUsage(username, cached, true);
+      res.status(200).type("application/json").send(cached);
+      return;
+    }
+
     // (1) 사용자별 원시 호출 한도.
-    // 예전에는 이 분기에 사용자별 검사가 아예 없어서, consume_usage를 건너뛰고
-    // 여기로 직접 요청하면 무한정 호출할 수 있었다(요금이 그대로 새는 구멍).
-    // 이제는 호출 "전에" 원자적으로 1 올리고, 그 결과로 한도를 판정한다.
+    // consume_usage를 건너뛰고 여기로 직접 요청해도 막히도록, 호출 "전에" 원자적으로
+    // 1 올리고 그 결과로 판정한다.
     const rawCallKey = "apicalls:" + username + ":" + today;
     const myCalls = await APP_KV.incr(rawCallKey, 172800);
     if (myCalls > RAW_CALL_DAILY_CAP) {
       return sendJson(res, { error: "오늘 요청이 너무 많아요. 잠시 후나 내일 다시 시도해주세요.", limitReached: true }, 429);
     }
 
-    // (2) 전체 한도. 마찬가지로 읽고-쓰기 대신 원자적 증가로 판정한다.
-    // 예전 방식은 동시에 들어온 요청들이 전부 같은 값을 읽고 전부 통과해서,
-    // 사실상 한도가 없는 것과 같았다.
+    // (2) 전체 한도. 마찬가지로 원자적 증가로 판정한다.
     const usageKey = "count:" + today;
     const globalCalls = await APP_KV.incr(usageKey, 172800);
     if (globalCalls > GLOBAL_DAILY_LIMIT) {
@@ -910,21 +1070,6 @@ async function handleAction(body, req, res) {
     }
 
     try {
-      // 모델과 분량은 사용자가 정하게 두지 않는다.
-      // 예전에는 body.model / body.max_tokens가 그대로 전달돼서, 비싼 모델에
-      // max_tokens를 크게 걸어 요금을 태울 수 있었다.
-      const requestedModel = typeof body.model === "string" ? body.model : "";
-      const requestedTokens = parseInt(body.max_tokens, 10);
-      const anthropicBody = {
-        model: ALLOWED_MODELS.includes(requestedModel) ? requestedModel : DEFAULT_MODEL,
-        max_tokens: Math.min(Number.isFinite(requestedTokens) && requestedTokens > 0 ? requestedTokens : 1000, MAX_TOKENS_CAP),
-        messages: body.messages,
-      };
-      if (body.enableSearch) {
-        // max_uses로 검색 횟수를 제한해둔다. 안 걸어두면 AI가 데이터를 찾으려고
-        // 검색을 여러 번 반복하면서 응답이 몇 분씩 걸리는 원인이 될 수 있다.
-        anthropicBody.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }];
-      }
       const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
@@ -938,6 +1083,18 @@ async function handleAction(body, req, res) {
       // 카운터는 호출 "전에" 이미 올렸다. 실패한 호출도 세는 셈인데,
       // 실패해도 토큰 요금이 나가는 경우가 있어서 이쪽이 안전한 방향이다.
       const data = await anthropicResponse.text();
+
+      if (anthropicResponse.ok) {
+        await recordTokenUsage(username, data, false);
+        // 성공한 응답만 보관한다. 오류 응답을 캐시하면 그 뒤로 계속 오류가 나간다.
+        if (data.length <= CACHE_MAX_CHARS) {
+          if (sharedTtl) await APP_KV.put(sharedKey, data, { expirationTtl: sharedTtl });
+          // 같은 사람이 탭을 다시 열거나 새로고침했을 때를 위한 짧은 보관.
+          // 주제 추천·로드맵처럼 매번 달라야 하는 건 여기에도 넣지 않는다.
+          if (!neverCache) await APP_KV.put(selfKey, data, { expirationTtl: 900 });
+        }
+      }
+
       res.status(anthropicResponse.status).type("application/json").send(data);
       return;
     } catch (err) {
