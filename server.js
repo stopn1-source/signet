@@ -139,6 +139,7 @@ const CACHE_TTL = {
   content:    60 * 60 * 24 * 30,  // 탐구내용 세 덩어리
   interview:  60 * 60 * 24 * 30,  // 면접 예상질문
   news:       60 * 60 * 24 * 7,   // 뉴스 연계 — 시의성이 있어 짧게
+  briefguide: 60 * 60 * 24 * 30,  // 안내문 항목별 안내
 };
 
 // 프롬프트에 이 말이 들어 있으면 종류와 상관없이 캐시하지 않는다.
@@ -244,7 +245,7 @@ app.use(cors({
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
-app.use(express.json());
+app.use(express.json({ limit: "12mb" }));
 
 // ===== 카카오/네이버 로그인 콜백 (GET, 브라우저가 카카오/네이버에서 돌아올 때) =====
 app.get("/oauth/kakao/callback", async (req, res) => {
@@ -1051,6 +1052,88 @@ async function handleAction(body, req, res) {
       }, 200);
     }
 
+    // ===== 선생님 안내문 분석 =====
+    // 글(text) 또는 파일(file: {name, type, data(base64)}) 하나를 받아 요구사항을 구조화해 돌려준다.
+    // 비용: 글자 파일 ≈ 5원, 사진·PDF ≈ 15원(Haiku). 일반 AI 호출과 같은 일일 호출 한도를 공유한다.
+    if (body.action === "analyze_brief") {
+      if (!process.env.ANTHROPIC_API_KEY) return sendJson(res, { error: "서버에 API 키가 설정되지 않았어요." }, 500);
+      let text = String(body.text || "").trim().slice(0, 12000);
+      let blocks = null;
+      let sourceKind = "text";
+      const file = body.file;
+      if (file && typeof file.data === "string") {
+        const name = String(file.name || "").toLowerCase();
+        const mime = String(file.type || "").toLowerCase();
+        if (file.data.length > BRIEF_MAX_BYTES * 1.4) return sendJson(res, { error: "파일이 너무 커요. 8MB 이하로 올려주세요." }, 400);
+        let buf;
+        try { buf = Buffer.from(file.data, "base64"); } catch (e) { return sendJson(res, { error: "파일을 읽지 못했어요." }, 400); }
+        if (buf.length > BRIEF_MAX_BYTES) return sendJson(res, { error: "파일이 너무 커요. 8MB 이하로 올려주세요." }, 400);
+        try {
+          if (name.endsWith(".hwp")) {
+            return sendJson(res, { error: "옛 한글(.hwp) 파일은 읽을 수 없어요. 한글에서 'PDF로 저장'하거나(파일 → PDF로 저장하기), 안내문을 사진으로 찍어 올려주세요." }, 400);
+          } else if (name.endsWith(".docx")) {
+            text = extractDocxText(buf); sourceKind = "docx";
+          } else if (name.endsWith(".hwpx")) {
+            text = extractHwpxText(buf); sourceKind = "hwpx";
+          } else if (name.endsWith(".txt") || mime === "text/plain") {
+            text = buf.toString("utf8"); sourceKind = "txt";
+          } else if (name.endsWith(".pdf") || mime === "application/pdf") {
+            blocks = [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: file.data } }]; sourceKind = "pdf";
+          } else if (/\.(png|jpe?g|webp|gif)$/.test(name) || /^image\/(png|jpeg|webp|gif)$/.test(mime)) {
+            const mt = /^image\/(png|jpeg|webp|gif)$/.test(mime) ? mime : (name.endsWith(".png") ? "image/png" : name.endsWith(".webp") ? "image/webp" : name.endsWith(".gif") ? "image/gif" : "image/jpeg");
+            blocks = [{ type: "image", source: { type: "base64", media_type: mt, data: file.data } }]; sourceKind = "image";
+          } else {
+            return sendJson(res, { error: "지원하지 않는 파일이에요. PDF, 사진(JPG·PNG), HWPX, DOCX, TXT로 올려주세요." }, 400);
+          }
+        } catch (e) {
+          return sendJson(res, { error: "파일 내용을 읽지 못했어요. 다른 형식(PDF나 사진)으로 올려보세요." }, 400);
+        }
+        if (!blocks && text.trim().length < 20) {
+          return sendJson(res, { error: "파일에서 글자를 거의 찾지 못했어요. 스캔한 문서면 사진이나 PDF로 올려주세요." }, 400);
+        }
+        text = text.slice(0, 12000);
+      }
+      if (!blocks && !text) return sendJson(res, { error: "안내문 내용이 비어 있어요." }, 400);
+
+      // 일반 AI 호출과 같은 사용자별 한도를 쓴다
+      const bToday = new Date().toISOString().slice(0, 10);
+      const bCalls = await APP_KV.incr("apicalls:" + username + ":" + bToday, 172800);
+      if (bCalls > RAW_CALL_DAILY_CAP) return sendJson(res, { error: "오늘 요청이 너무 많아요. 잠시 후나 내일 다시 시도해주세요.", limitReached: true }, 429);
+
+      const content = blocks
+        ? blocks.concat([{ type: "text", text: BRIEF_INSTRUCTION }])
+        : [{ type: "text", text: "안내문 원문:\n" + text + "\n\n" + BRIEF_INSTRUCTION }];
+      const callModel = async (model) => fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "user-agent": "signet-backend/1.0 (Render)" },
+        body: JSON.stringify({ model, max_tokens: 1800, messages: [{ role: "user", content }] }),
+      });
+      try {
+        let r = await callModel("claude-haiku-5-5");
+        // Haiku가 PDF 같은 입력을 못 받는 경우(400)에는 기본 모델로 한 번 더
+        if (r.status === 400 && blocks) r = await callModel(DEFAULT_MODEL);
+        const raw = await r.text();
+        if (r.status === 401 || r.status === 403) {
+          console.error("[Anthropic 인증 오류/analyze_brief]", r.status, raw.slice(0, 200));
+          return sendJson(res, { error: "AI 서버 연결에 문제가 생겼어요. 잠시 후 다시 시도해주세요." }, 502);
+        }
+        if (!r.ok) {
+          console.error("[analyze_brief 실패]", r.status, raw.slice(0, 300));
+          return sendJson(res, { error: "안내문을 분석하지 못했어요. 잠시 후 다시 시도해주세요." }, 502);
+        }
+        await recordTokenUsage(username, raw, false);
+        let outText = "";
+        try { outText = (JSON.parse(raw).content || []).filter(c => c.type === "text").map(c => c.text).join("\n"); } catch (e) {}
+        const brief = parseBrief(outText);
+        // 화면과 다음 프롬프트에서 쓸 원문: 글자 파일은 뽑은 글자, 사진·PDF는 모델이 옮겨 적은 것
+        brief.text = blocks ? brief.text : text.slice(0, 3000);
+        brief.source = sourceKind;
+        return sendJson(res, { success: true, brief }, 200);
+      } catch (err) {
+        return sendJson(res, { error: "안내문 분석 중 오류: " + err.message }, 500);
+      }
+    }
+
     // ===== 그 외: AI 요청 처리 =====
     if (!process.env.ANTHROPIC_API_KEY) {
       return sendJson(res, { error: "서버에 API 키가 설정되지 않았어요. Environment에서 ANTHROPIC_API_KEY를 추가해주세요." }, 500);
@@ -1158,6 +1241,109 @@ async function handleAction(body, req, res) {
     } catch (err) {
       return sendJson(res, { error: err.message }, 500);
     }
+}
+
+// ============================================================
+// 선생님 안내문 읽기 (파일 → 글자)
+// 외부 라이브러리 없이 처리한다. docx·hwpx는 zip 안의 XML이라 zlib만 있으면 풀 수 있고,
+// PDF와 사진은 Anthropic에 그대로 넘겨 읽게 한다. 옛 .hwp는 바이너리 포맷이라 못 읽는다.
+// ============================================================
+const zlib = require("zlib");
+const BRIEF_MAX_BYTES = 8 * 1024 * 1024;
+
+// zip 안의 파일 하나를 꺼낸다. 중앙 디렉터리를 뒤에서부터 찾아 이름이 맞는 항목만 푼다.
+function zipEntries(buf) {
+  const entries = {};
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 70000); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return entries;
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  for (let n = 0; n < count && off + 46 <= buf.length; n++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) break;
+    const method = buf.readUInt16LE(off + 10);
+    const csize = buf.readUInt32LE(off + 20);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const commentLen = buf.readUInt16LE(off + 32);
+    const localOff = buf.readUInt32LE(off + 42);
+    const name = buf.slice(off + 46, off + 46 + nameLen).toString("utf8");
+    entries[name] = { method, csize, localOff };
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+function zipRead(buf, entries, name) {
+  const e = entries[name];
+  if (!e || buf.readUInt32LE(e.localOff) !== 0x04034b50) return null;
+  const nameLen = buf.readUInt16LE(e.localOff + 26);
+  const extraLen = buf.readUInt16LE(e.localOff + 28);
+  const start = e.localOff + 30 + nameLen + extraLen;
+  const data = buf.slice(start, start + e.csize);
+  if (e.method === 0) return data;
+  if (e.method === 8) return zlib.inflateRawSync(data);
+  return null;
+}
+function xmlToText(xml, paragraphTag) {
+  return String(xml)
+    .replace(new RegExp("</" + paragraphTag + ">", "g"), "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/[ \t]+/g, " ").replace(/\n\s*\n+/g, "\n").trim();
+}
+function extractDocxText(buf) {
+  const entries = zipEntries(buf);
+  const xml = zipRead(buf, entries, "word/document.xml");
+  return xml ? xmlToText(xml.toString("utf8"), "w:p") : "";
+}
+function extractHwpxText(buf) {
+  const entries = zipEntries(buf);
+  const names = Object.keys(entries).filter(n => /^Contents\/section\d+\.xml$/.test(n)).sort();
+  return names.map(n => { const x = zipRead(buf, entries, n); return x ? xmlToText(x.toString("utf8"), "hp:p") : ""; }).join("\n").trim();
+}
+
+// 안내문에서 뽑아낼 것. 화면은 이 항목들을 그대로 보여주고, 주제·탐구내용 프롬프트에도 넣는다.
+const BRIEF_INSTRUCTION = `위 내용은 선생님이 학생에게 나눠준 수행평가·탐구활동 안내문이야. 학생이 이 안내문에 맞는 탐구를 설계할 수 있게, 안내문에 적힌 요구사항을 빠짐없이 정리해줘.
+
+규칙:
+- 안내문에 실제로 적힌 것만 정리해. 없는 조건을 지어내지 마. 없으면 비워둬.
+- 요구 항목(ITEMS)은 목차·구성 요소·반드시 포함할 내용처럼 "결과물에 들어가야 하는 것"을 하나씩. 항목마다 선생님이 거기서 무엇을 보려는지 1문장.
+- 존댓말(해요체)로, 학생에게 설명하듯 자연스럽게.
+
+절대로 다른 설명 없이, 아래 형식으로만 정확히 응답해. 문장 안에 큰따옴표(")는 쓰지 마.
+
+TYPE: 주제탐구 / 실험 / 독서 / 발표 / 창작물 / 토론 / 기타 중 하나
+TITLE: 과제 이름과 과목 (예: 생명과학Ⅰ 효소 탐구 보고서)
+LENGTH: 분량 (예: A4 2장, 1500자 내외, 발표 5분). 없으면 비워둬
+FORMAT: 제출 형식 (예: 보고서, PPT 10장 이내, 구두 발표, 손글씨). 없으면 비워둬
+DUE: 제출 기한. 없으면 비워둬
+CRITERIA: 평가 기준이나 배점을 | 로 구분. 없으면 비워둬
+ITEMS: 항목이름::선생님이 이 항목에서 기대하는 것 형태로, | 로 구분
+NOTES: 그 밖에 꼭 지켜야 하는 조건 1~3개를 | 로 구분 (금지 사항, 참고문헌 표기, 감점 조건 등). 없으면 비워둬
+TEXT: 사진이나 PDF로 받았을 때만, 안내문의 핵심 내용을 원문에 가깝게 1500자 안으로 옮겨 적어. 글자로 받은 경우는 비워둬`;
+
+function briefField(text, label, next) {
+  const re = new RegExp(label + ":[ \\t]*([\\s\\S]*?)(?=\\n(?:" + next.join("|") + "):|$)", "i");
+  const m = text.match(re);
+  return m ? m[1].trim() : "";
+}
+function parseBrief(text) {
+  const labels = ["TYPE", "TITLE", "LENGTH", "FORMAT", "DUE", "CRITERIA", "ITEMS", "NOTES", "TEXT"];
+  const get = l => briefField(text, l, labels.filter(x => x !== l));
+  const split = v => v.split("|").map(x => x.trim()).filter(Boolean);
+  return {
+    type: get("TYPE").replace(/[^가-힣]/g, "").slice(0, 10),
+    title: get("TITLE"),
+    length: get("LENGTH"),
+    format: get("FORMAT"),
+    due: get("DUE"),
+    criteria: split(get("CRITERIA")),
+    items: split(get("ITEMS")).map(c => { const p = c.split("::"); return { name: (p[0] || "").trim(), expect: (p[1] || "").trim() }; }).filter(i => i.name),
+    notes: split(get("NOTES")),
+    text: get("TEXT").slice(0, 2000),
+  };
 }
 
 // ============================================================
