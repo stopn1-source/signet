@@ -1052,6 +1052,44 @@ async function handleAction(body, req, res) {
       }, 200);
     }
 
+    // ===== 그림 찾기 (위키미디어 공용) =====
+    // 탐구내용 옆에 붙일 그림을 찾는다. 공용 저장소라 무료이고 출처·라이선스가 같이 온다.
+    // 학생이 사진 출처를 적어야 하는 수행평가에 그대로 쓸 수 있다.
+    if (body.action === "image_search") {
+      const q = String(body.query || "").trim().slice(0, 80);
+      if (!q) return sendJson(res, { error: "검색어가 비어 있어요." }, 400);
+      const ikey = "img:" + nodeCrypto.createHash("sha256").update(q.toLowerCase()).digest("hex").slice(0, 32);
+      const hit = await APP_KV.get(ikey);
+      if (hit) { res.status(200).type("application/json").send(hit); return; }
+      try {
+        const url = "https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search&gsrnamespace=6&gsrlimit=8"
+          + "&gsrsearch=" + encodeURIComponent(q + " filetype:bitmap|drawing") + "&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=720";
+        const r = await fetch(url, { headers: { "User-Agent": "signet-backend/1.0 (https://si9net.com)" } });
+        if (!r.ok) return sendJson(res, { items: [] }, 200);
+        const data = await r.json();
+        const strip = t => String(t || "").replace(/<[^>]+>/g, "").trim();
+        // 검색 순위대로 정렬하고, 다른 언어판 도식(… de.svg 같은 것)은 뒤로 보낸다
+        const pages = Object.values((data.query && data.query.pages) || {}).sort((a, b) => (a.index || 0) - (b.index || 0));
+        const foreign = t => /[ _-](de|es|pl|id|fr|ru|ja|zh|it|pt|tr|ku|nl|cs|uk|fa|ar|he|ko|vi|th)\d*\.(svg|png)$/i.test(t);
+        pages.sort((a, b) => (foreign(a.title) ? 1 : 0) - (foreign(b.title) ? 1 : 0));
+        const items = pages
+          .map(pg => { const ii = (pg.imageinfo || [])[0] || {}; const md = ii.extmetadata || {}; return {
+            title: String(pg.title || "").replace(/^File:/, ""),
+            thumb: ii.thumburl || "", url: ii.url || "", page: ii.descriptionurl || "",
+            mime: ii.mime || "",
+            artist: strip((md.Artist || {}).value).slice(0, 80),
+            license: strip((md.LicenseShortName || {}).value).slice(0, 40),
+          }; })
+          .filter(it => it.thumb && /^image\/(jpeg|png|svg\+xml|gif|webp)$/.test(it.mime))
+          .slice(0, 4);
+        const payload = JSON.stringify({ items });
+        await APP_KV.put(ikey, payload, { expirationTtl: 60 * 60 * 24 * 14 });
+        res.status(200).type("application/json").send(payload);
+      } catch (err) {
+        return sendJson(res, { items: [], error: err.message }, 200);
+      }
+    }
+
     // ===== 선생님 안내문 분석 =====
     // 글(text) 또는 파일(file: {name, type, data(base64)}) 하나를 받아 요구사항을 구조화해 돌려준다.
     // 비용: 글자 파일 ≈ 5원, 사진·PDF ≈ 15원(Haiku). 일반 AI 호출과 같은 일일 호출 한도를 공유한다.
