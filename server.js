@@ -9,6 +9,10 @@
 //   KAKAO_CLIENT_ID / KAKAO_CLIENT_SECRET   (카카오 로그인 쓸 때)
 //   NAVER_CLIENT_ID / NAVER_CLIENT_SECRET   (네이버 로그인 쓸 때)
 //   PAGES_URL                 프론트엔드(Cloudflare Pages) 주소
+//   NAVER_SEARCH_CLIENT_ID / NAVER_SEARCH_CLIENT_SECRET
+//                             (선택) 네이버 뉴스 검색 API. 넣으면 뉴스 탭이 Anthropic 웹검색 대신
+//                             네이버 검색으로 기사를 찾아서 원가가 1/4로 줄어요. 없으면 예전 방식 그대로.
+//                             developers.naver.com → 내 애플리케이션 → 사용 API에 "검색" 추가
 //   BACKEND_URL                이 서버 자신의 Render 주소 (카카오/네이버 redirect_uri 계산용)
 //
 // 신고(report_content)된 글은 자동으로 삭제되지 않아요. Upstash 콘솔에서
@@ -88,7 +92,8 @@ const APP_KV = {
 // ===== AI 호출 안전장치 =====
 // 프론트엔드가 실제로 쓰는 모델만 허용한다. 사용자가 body.model로 비싼 모델을
 // 지정해서 요금을 태우는 걸 막기 위해, 목록에 없으면 무조건 기본 모델로 되돌린다.
-const ALLOWED_MODELS = ["claude-sonnet-5"];
+// 가벼운 호출(참고자료·교육과정·용어·면접·뉴스 정리)은 Haiku로 돌린다. Sonnet의 1/20 가격이다.
+const ALLOWED_MODELS = ["claude-sonnet-5", "claude-haiku-5-5"];
 const DEFAULT_MODEL = "claude-sonnet-5";
 // 한 번의 호출에서 만들 수 있는 최대 분량. 프론트가 제일 크게 쓰는 값이 7000이라
 // 그보다 약간 여유를 둔 상한으로 자른다.
@@ -977,6 +982,39 @@ async function handleAction(body, req, res) {
       return sendJson(res, { success: true, used, limit, remaining: Math.max(0, limit - used) }, 200);
     }
 
+    // ===== 뉴스 기사 찾기 (네이버 검색 API) =====
+    // Claude에게 "검색해서 찾아봐"라고 시키면 검색 결과 본문이 통째로 입력 토큰에 실려서
+    // 뉴스 탭 하나가 110원쯤 나간다. 대신 네이버가 기사 제목·요약·링크를 공짜로 주니까
+    // 그걸 받아서 Claude에게는 "이 중에서 골라 정리해줘"만 시킨다. 링크가 진짜라는 보장도 생긴다.
+    // 키가 없으면 {available:false}를 돌려주고, 프론트가 예전 방식으로 알아서 넘어간다.
+    if (body.action === "news_search") {
+      const cid = process.env.NAVER_SEARCH_CLIENT_ID, csec = process.env.NAVER_SEARCH_CLIENT_SECRET;
+      if (!cid || !csec) return sendJson(res, { available: false, items: [] }, 200);
+      const q = String(body.query || "").trim().slice(0, 80);
+      if (!q) return sendJson(res, { error: "검색어가 비어 있어요." }, 400);
+      const nkey = "news:" + nodeCrypto.createHash("sha256").update(q).digest("hex").slice(0, 32);
+      const hit = await APP_KV.get(nkey);
+      if (hit) { res.status(200).type("application/json").send(hit); return; }
+      try {
+        const r = await fetch("https://openapi.naver.com/v1/search/news.json?display=8&sort=sim&query=" + encodeURIComponent(q), {
+          headers: { "X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec }
+        });
+        if (!r.ok) return sendJson(res, { available: false, items: [], error: "naver " + r.status }, 200);
+        const data = await r.json();
+        const strip = t => String(t || "").replace(/<[^>]+>/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#39;/g, "'");
+        const items = (data.items || []).map(it => ({
+          title: strip(it.title), summary: strip(it.description),
+          link: it.originallink || it.link || "", date: String(it.pubDate || "").slice(0, 16)
+        })).filter(it => it.title && /^https?:\/\//.test(it.link)).slice(0, 6);
+        const payload = JSON.stringify({ available: true, items });
+        await APP_KV.put(nkey, payload, { expirationTtl: 60 * 60 * 24 * 3 });   // 같은 검색어는 3일 재사용
+        res.status(200).type("application/json").send(payload);
+      } catch (err) {
+        return sendJson(res, { available: false, items: [], error: err.message }, 200);
+      }
+      return;
+    }
+
     // ===== 이번 달 토큰 사용량과 예상 요금 =====
     // 추정이 아니라 실제로 쓴 양을 보여준다. 캐시가 얼마나 아껴줬는지도 함께.
     if (body.action === "get_cost") {
@@ -1095,6 +1133,13 @@ async function handleAction(body, req, res) {
         }
       }
 
+      // Anthropic이 401/403을 주는 건 "서버의 API 키" 문제지 학생의 로그인 문제가 아니다.
+      // 그대로 401을 넘기면 화면이 로그인 만료로 착각해서 학생을 로그아웃시킨다.
+      // 그래서 502로 바꾸고 무슨 일인지 서버 로그에 남긴다.
+      if (anthropicResponse.status === 401 || anthropicResponse.status === 403) {
+        console.error("[Anthropic 인증 오류]", anthropicResponse.status, data.slice(0, 300));
+        return sendJson(res, { error: "AI 서버 연결에 문제가 생겼어요. 잠시 후 다시 시도해주세요. (관리자 확인 중)" }, 502);
+      }
       res.status(anthropicResponse.status).type("application/json").send(data);
       return;
     } catch (err) {
