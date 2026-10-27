@@ -12,6 +12,9 @@
 //   NAVER_SEARCH_CLIENT_ID / NAVER_SEARCH_CLIENT_SECRET
 //                             (선택) 네이버 뉴스 검색 API. 넣으면 뉴스 탭이 Anthropic 웹검색 대신
 //                             네이버 검색으로 기사를 찾아서 원가가 1/4로 줄어요. 없으면 예전 방식 그대로.
+//                             2026-07부터 검색 API는 네이버 클라우드 "NAVER API HUB"에서 발급해요
+//                             (콘솔 → NAVER API HUB → Application → 인증 정보의 Client ID / Client Secret).
+//                             옛 개발자센터 키를 넣어도 돌아가게 두 주소를 차례로 시도해요.
 //                             developers.naver.com → 내 애플리케이션 → 사용 API에 "검색" 추가
 //   BACKEND_URL                이 서버 자신의 Render 주소 (카카오/네이버 redirect_uri 계산용)
 //
@@ -996,10 +999,20 @@ async function handleAction(body, req, res) {
       const hit = await APP_KV.get(nkey);
       if (hit) { res.status(200).type("application/json").send(hit); return; }
       try {
-        const r = await fetch("https://openapi.naver.com/v1/search/news.json?display=8&sort=sim&query=" + encodeURIComponent(q), {
-          headers: { "X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec }
+        // 1순위: NAVER API HUB(네이버 클라우드). 키가 HUB 것이 아니면 401/403/404가 나니 그때만 옛 주소로 한 번 더.
+        const qs = "?display=8&sort=sim&query=" + encodeURIComponent(q);
+        let r = await fetch("https://naverapihub.apigw.ntruss.com/search/v1/news" + qs + "&format=json", {
+          headers: { "X-NCP-APIGW-API-KEY-ID": cid, "X-NCP-APIGW-API-KEY": csec }
         });
-        if (!r.ok) return sendJson(res, { available: false, items: [], error: "naver " + r.status }, 200);
+        if (r.status === 401 || r.status === 403 || r.status === 404) {
+          r = await fetch("https://openapi.naver.com/v1/search/news.json" + qs, {
+            headers: { "X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec }
+          });
+        }
+        if (!r.ok) {
+          console.error("naver news_search failed:", r.status);
+          return sendJson(res, { available: false, items: [], error: "naver " + r.status }, 200);
+        }
         const data = await r.json();
         const strip = t => String(t || "").replace(/<[^>]+>/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#39;/g, "'");
         const items = (data.items || []).map(it => ({
