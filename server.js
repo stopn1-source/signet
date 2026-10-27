@@ -1106,12 +1106,11 @@ async function handleAction(body, req, res) {
       const callModel = async (model) => fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "user-agent": "signet-backend/1.0 (Render)" },
-        body: JSON.stringify({ model, max_tokens: 1800, messages: [{ role: "user", content }] }),
+        body: JSON.stringify({ model, max_tokens: 2500, messages: [{ role: "user", content }] }),
       });
       try {
-        let r = await callModel("claude-haiku-5-5");
-        // Haiku가 PDF 같은 입력을 못 받는 경우(400)에는 기본 모델로 한 번 더
-        if (r.status === 400 && blocks) r = await callModel(DEFAULT_MODEL);
+        // 항목을 빠뜨리면 그 뒤 결과물이 전부 어긋나서, 이 호출만은 기본 모델(Sonnet)로 돌린다 (약 40원)
+        let r = await callModel(DEFAULT_MODEL);
         const raw = await r.text();
         if (r.status === 401 || r.status === 403) {
           console.error("[Anthropic 인증 오류/analyze_brief]", r.status, raw.slice(0, 200));
@@ -1309,7 +1308,14 @@ const BRIEF_INSTRUCTION = `위 내용은 선생님이 학생에게 나눠준 수
 
 규칙:
 - 안내문에 실제로 적힌 것만 정리해. 없는 조건을 지어내지 마. 없으면 비워둬.
-- 요구 항목(ITEMS)은 목차·구성 요소·반드시 포함할 내용처럼 "결과물에 들어가야 하는 것"을 하나씩. 항목마다 선생님이 거기서 무엇을 보려는지 1문장.
+- 요구 항목(ITEMS)이 제일 중요해. 결과물에 들어가야 하는 칸을 하나씩 뽑아. 다음은 전부 요구 항목이야:
+  · 제출 양식의 칸(예: 제목 / 주제를 선택한 동기 / 과학적 원리 / 결론 / 참고 자료 출처)
+  · 채점 요소·평가 요소·평가 기준 표의 각 줄(예: 1) 제목을 주제와 관련지어 명확히 표현 → 항목 이름은 제목)
+  · 목차·구성·반드시 포함할 내용
+  양식의 칸과 채점 요소가 둘 다 있으면 양식의 칸을 항목으로 삼고, 해당 채점 요소의 내용을 그 항목의 "기대하는 것"에 녹여. 기한 준수처럼 결과물의 칸이 아닌 조건은 NOTES로 보내.
+  안내문이 양식이나 채점표 없이 과제만 설명하면, 그 설명에서 결과물에 들어가야 할 것을 뽑아 항목으로 만들어. 정말 아무것도 없을 때만 비워둬.
+- 항목마다 선생님이 거기서 무엇을 보려는지 1문장. 채점표 문구가 있으면 그 말을 써.
+- 출처 표기 방식, AI 출처 불인정, 교과서 내용만 베끼면 안 됨 같은 조건은 NOTES에 꼭 넣어.
 - 존댓말(해요체)로, 학생에게 설명하듯 자연스럽게.
 
 절대로 다른 설명 없이, 아래 형식으로만 정확히 응답해. 문장 안에 큰따옴표(")는 쓰지 마.
@@ -1329,7 +1335,12 @@ function briefField(text, label, next) {
   const m = text.match(re);
   return m ? m[1].trim() : "";
 }
-function parseBrief(text) {
+function parseBrief(rawText) {
+  // 모델이 **TYPE:** 처럼 굵게 쓰거나 줄머리 기호를 붙여도 읽히게 정리한다
+  const text = String(rawText || "")
+    .replace(/\*\*/g, "").replace(/`/g, "")
+    .replace(/^\s*[-•·]\s*(?=[A-Z]{3,}:)/gm, "")
+    .replace(/^\s*#+\s*/gm, "");
   const labels = ["TYPE", "TITLE", "LENGTH", "FORMAT", "DUE", "CRITERIA", "ITEMS", "NOTES", "TEXT"];
   const get = l => briefField(text, l, labels.filter(x => x !== l));
   const split = v => v.split("|").map(x => x.trim()).filter(Boolean);
@@ -1340,7 +1351,8 @@ function parseBrief(text) {
     format: get("FORMAT"),
     due: get("DUE"),
     criteria: split(get("CRITERIA")),
-    items: split(get("ITEMS")).map(c => { const p = c.split("::"); return { name: (p[0] || "").trim(), expect: (p[1] || "").trim() }; }).filter(i => i.name),
+    items: get("ITEMS").split(/\||\n/).map(x => x.trim().replace(/^[-•·\d.)\s]+/, "")).filter(Boolean)
+      .map(c => { const p = c.split("::"); return { name: (p[0] || "").trim().slice(0, 60), expect: (p[1] || "").trim() }; }).filter(i => i.name),
     notes: split(get("NOTES")),
     text: get("TEXT").slice(0, 2000),
   };
