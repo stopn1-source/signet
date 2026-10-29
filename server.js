@@ -1090,70 +1090,6 @@ async function handleAction(body, req, res) {
       }
     }
 
-    // ===== 생기부 읽기 (활동 요약만) =====
-    // 파일(PDF·사진·HWPX·DOCX)을 받아 "과목별로 무엇을 했는지"만 돌려준다.
-    // 원문은 이 요청을 처리하는 동안만 메모리에 있고, 저장하지 않는다. 응답에도 원문을 넣지 않는다.
-    if (body.action === "analyze_record") {
-      if (!process.env.ANTHROPIC_API_KEY) return sendJson(res, { error: "서버에 API 키가 설정되지 않았어요." }, 500);
-      if (!body.consent) return sendJson(res, { error: "개인정보 처리 동의가 필요해요." }, 400);
-      const file = body.file;
-      if (!file || typeof file.data !== "string") return sendJson(res, { error: "파일이 비어 있어요." }, 400);
-      const name = String(file.name || "").toLowerCase();
-      const mime = String(file.type || "").toLowerCase();
-      if (file.data.length > BRIEF_MAX_BYTES * 1.4) return sendJson(res, { error: "파일이 너무 커요. 8MB 이하로 올려주세요. 쪽을 나눠 저장해서 여러 번 올려도 돼요." }, 400);
-      let buf;
-      try { buf = Buffer.from(file.data, "base64"); } catch (e) { return sendJson(res, { error: "파일을 읽지 못했어요." }, 400); }
-      if (buf.length > BRIEF_MAX_BYTES) return sendJson(res, { error: "파일이 너무 커요. 8MB 이하로 올려주세요." }, 400);
-      let text = "", blocks = null;
-      try {
-        if (name.endsWith(".hwp")) return sendJson(res, { error: "옛 한글(.hwp)은 읽을 수 없어요. PDF로 저장하거나 사진으로 찍어 올려주세요." }, 400);
-        else if (name.endsWith(".docx")) text = extractDocxText(buf);
-        else if (name.endsWith(".hwpx")) text = extractHwpxText(buf);
-        else if (name.endsWith(".txt") || mime === "text/plain") text = buf.toString("utf8");
-        else if (name.endsWith(".pdf") || mime === "application/pdf") blocks = [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: file.data } }];
-        else if (/\.(png|jpe?g|webp|gif)$/.test(name) || /^image\/(png|jpeg|webp|gif)$/.test(mime)) {
-          const mt = /^image\/(png|jpeg|webp|gif)$/.test(mime) ? mime : (name.endsWith(".png") ? "image/png" : name.endsWith(".webp") ? "image/webp" : name.endsWith(".gif") ? "image/gif" : "image/jpeg");
-          blocks = [{ type: "image", source: { type: "base64", media_type: mt, data: file.data } }];
-        } else return sendJson(res, { error: "지원하지 않는 파일이에요. PDF, 사진(JPG·PNG), HWPX, DOCX로 올려주세요." }, 400);
-      } catch (e) {
-        return sendJson(res, { error: "파일 내용을 읽지 못했어요. PDF나 사진으로 올려보세요." }, 400);
-      }
-      if (!blocks && text.trim().length < 50) return sendJson(res, { error: "파일에서 글자를 거의 찾지 못했어요. 스캔본이면 사진이나 PDF로 올려주세요." }, 400);
-      text = text.slice(0, 40000);
-
-      const rToday = new Date().toISOString().slice(0, 10);
-      const rCalls = await APP_KV.incr("apicalls:" + username + ":" + rToday, 172800);
-      if (rCalls > RAW_CALL_DAILY_CAP) return sendJson(res, { error: "오늘 요청이 너무 많아요. 잠시 후나 내일 다시 시도해주세요.", limitReached: true }, 429);
-
-      const content = blocks
-        ? blocks.concat([{ type: "text", text: RECORD_INSTRUCTION }])
-        : [{ type: "text", text: "생기부 내용:\n" + text + "\n\n" + RECORD_INSTRUCTION }];
-      try {
-        const r = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "user-agent": "signet-backend/1.0 (Render)" },
-          body: JSON.stringify({ model: DEFAULT_MODEL, max_tokens: 4000, messages: [{ role: "user", content }] }),
-        });
-        const raw = await r.text();
-        if (r.status === 401 || r.status === 403) {
-          console.error("[Anthropic 인증 오류/analyze_record]", r.status);
-          return sendJson(res, { error: "AI 서버 연결에 문제가 생겼어요. 잠시 후 다시 시도해주세요." }, 502);
-        }
-        if (!r.ok) {
-          console.error("[analyze_record 실패]", r.status, raw.slice(0, 200));
-          return sendJson(res, { error: "생기부를 읽지 못했어요. 잠시 후 다시 시도해주세요." }, 502);
-        }
-        await recordTokenUsage(username, raw, false);
-        let outText = "";
-        try { outText = (JSON.parse(raw).content || []).filter(c => c.type === "text").map(c => c.text).join("\n"); } catch (e) {}
-        const parsed = parseRecord(outText);
-        // 원문(buf, text, blocks)은 여기서 끝. 아무 데도 저장하지 않는다.
-        return sendJson(res, { success: true, record: parsed }, 200);
-      } catch (err) {
-        return sendJson(res, { error: "생기부 읽기 중 오류: " + err.message }, 500);
-      }
-    }
-
     // ===== 선생님 안내문 분석 =====
     // 글(text) 또는 파일(file: {name, type, data(base64)}) 하나를 받아 요구사항을 구조화해 돌려준다.
     // 비용: 글자 파일 ≈ 5원, 사진·PDF ≈ 15원(Haiku). 일반 AI 호출과 같은 일일 호출 한도를 공유한다.
@@ -1403,38 +1339,6 @@ function extractHwpxText(buf) {
   const entries = zipEntries(buf);
   const names = Object.keys(entries).filter(n => /^Contents\/section\d+\.xml$/.test(n)).sort();
   return names.map(n => { const x = zipRead(buf, entries, n); return x ? xmlToText(x.toString("utf8"), "hp:p") : ""; }).join("\n").trim();
-}
-
-// 생기부에서 뽑아낼 것: "어떤 활동을 했는지"만. 개인정보·성적·평가 문장은 뽑지 않는다.
-// 원문은 이 요청 안에서만 쓰고 저장하지 않는다 (아래 analyze_record 참고).
-const RECORD_INSTRUCTION = `위 내용은 고등학생의 학교생활기록부(생기부)야. 이 학생이 다음 탐구 계획을 "이미 한 활동에 이어서" 짤 수 있도록, 지금까지 어떤 탐구·활동을 했는지만 과목별로 정리해줘.
-
-반드시 지켜:
-- 뽑는 것: 학년, 과목(또는 영역: 자율활동/동아리/진로활동/독서), 무엇을 했는지(탐구 소재·방법·결론·읽은 책). 이것만.
-- 절대 뽑지 않는 것: 이름, 학교명, 학번, 반·번호, 생년월일, 주소, 성적·등급·석차·점수, 출결, 봉사 시간, 수상 이름, 선생님의 평가·성품 묘사 문장(예: 성실하다, 리더십이 있다). 활동 내용이 아닌 말은 모두 버려.
-- 한 활동은 한 줄로, 소재와 방법이 보이게 구체적으로 (예: 화학Ⅰ — 촉매 유무에 따른 과산화수소 분해 속도 비교 실험, 효소 작용에 비유해 발표).
-- 같은 과목에 여러 활동이 있으면 줄을 나눠. 최대 40줄.
-- 마지막에 이 학생의 관심사가 어떻게 이어져 왔는지(어떤 줄기가 보이는지) 1~2문장.
-- 존댓말(해요체)로 쓰되 평가하는 말은 넣지 마.
-
-절대로 다른 설명 없이, 아래 형식으로만 정확히 응답해. 문장 안에 큰따옴표(")는 쓰지 마.
-
-ITEM: 학년::과목이나 영역::무엇을 했는지 한 줄
-(ITEM: 줄을 활동 수만큼, 한 줄에 하나씩. 학년은 1학년/2학년/3학년 중 하나, 모르면 비워둬)
-THREAD: 지금까지 보이는 관심사의 흐름 1~2문장`;
-
-function parseRecord(rawText) {
-  const text = String(rawText || "").replace(/\*\*/g, "").replace(/`/g, "");
-  const items = [];
-  text.split(/\n/).forEach(line => {
-    const m = line.match(/^\s*[-•·]?\s*ITEM:\s*(.+)$/i);
-    if (!m) return;
-    const p = m[1].split("::").map(x => x.trim());
-    if (p.length < 3 || !p[2]) return;
-    items.push({ grade: p[0].replace(/[^0-9]/g, "") ? p[0].replace(/[^0-9]/g, "") + "학년" : "", subject: p[1].slice(0, 40), what: p[2].slice(0, 300) });
-  });
-  const tm = text.match(/THREAD:\s*([\s\S]*?)$/i);
-  return { items: items.slice(0, 40), thread: tm ? tm[1].trim().slice(0, 400) : "" };
 }
 
 // 안내문에서 뽑아낼 것. 화면은 이 항목들을 그대로 보여주고, 주제·탐구내용 프롬프트에도 넣는다.
