@@ -9,18 +9,10 @@
 //   KAKAO_CLIENT_ID / KAKAO_CLIENT_SECRET   (카카오 로그인 쓸 때)
 //   NAVER_CLIENT_ID / NAVER_CLIENT_SECRET   (네이버 로그인 쓸 때)
 //   PAGES_URL                 프론트엔드(Cloudflare Pages) 주소
-//   NAVER_SEARCH_CLIENT_ID / NAVER_SEARCH_CLIENT_SECRET
-//                             (선택) 네이버 뉴스 검색 API. 넣으면 뉴스 탭이 Anthropic 웹검색 대신
-//                             네이버 검색으로 기사를 찾아서 원가가 1/4로 줄어요. 없으면 예전 방식 그대로.
-//                             2026-07부터 검색 API는 네이버 클라우드 "NAVER API HUB"에서 발급해요
-//                             (콘솔 → NAVER API HUB → Application → 인증 정보의 Client ID / Client Secret).
-//                             옛 개발자센터 키를 넣어도 돌아가게 두 주소를 차례로 시도해요.
-//                             developers.naver.com → 내 애플리케이션 → 사용 API에 "검색" 추가
 //   BACKEND_URL                이 서버 자신의 Render 주소 (카카오/네이버 redirect_uri 계산용)
 //
-// 신고(report_content)된 글은 자동으로 삭제되지 않아요. Upstash 콘솔에서
-// report: 로 시작하는 키를 직접 확인하고, 필요하면 posts 키 안의 해당 글/답글을
-// 수동으로 지워주세요 (지금은 별도 관리자 화면이 없어요).
+// 커뮤니티(posts)·아바타·네이버 뉴스 검색은 2026-11에 걷어냈어요. 옛 posts/report: 키가 Redis에
+// 남아 있으면 Upstash 콘솔에서 지워도 돼요.
 
 const express = require("express");
 const cors = require("cors");
@@ -308,17 +300,6 @@ async function handleAction(body, req, res) {
       const record = await APP_KV.get("user:" + username);
       const userObj = record ? JSON.parse(record) : {};
 
-      // 게시판 글·답글은 먼저 지운다(남겨두면 탈퇴한 사람 이름이 계속 노출된다)
-      const postsRaw = await APP_KV.get("posts");
-      if (postsRaw) {
-        let posts = JSON.parse(postsRaw);
-        posts = posts.filter(p => p.username !== username);
-        posts.forEach(p => {
-          p.replies = (p.replies || []).filter(r => r.username !== username);
-        });
-        await APP_KV.put("posts", JSON.stringify(posts));
-      }
-
       // 소셜 로그인 연결고리 삭제 — 안 지우면 같은 소셜 계정으로 다시 로그인했을 때
       // 사라진 옛 아이디로 연결되어 버린다
       if (userObj.oauthProvider && userObj.oauthId) {
@@ -489,131 +470,7 @@ async function handleAction(body, req, res) {
       return sendJson(res, { success: true }, 200);
     }
 
-    // ===== 아바타 설정 =====
-    if (body.action === "set_avatar") {
-      const ALLOWED_AVATARS = ["🦊","🐱","🐰","🐻","🐼","🦉","🐨","🐯","🦁","🐸","🐧","🦄","🐶","🐹","🐢","🦋","🐺","🦝","🦔","🦓","🐮","🐷","🐵","🦒","🐘","🦥","🦦","🦩","🐬","🦅","🐴","🦌"];
-      const avatar = body.avatar || "";
-      if (!ALLOWED_AVATARS.includes(avatar)) {
-        return sendJson(res, { error: "선택할 수 없는 아바타예요." }, 400);
-      }
-      const record = await APP_KV.get("user:" + username);
-      if (!record) {
-        return sendJson(res, { error: "계정 정보를 찾을 수 없어요." }, 404);
-      }
-      const userObj = JSON.parse(record);
-      await APP_KV.put("user:" + username, JSON.stringify({ ...userObj, avatar }));
-      return sendJson(res, { success: true, avatar }, 200);
-    }
-
-    // ===== 커뮤니티: 글쓰기 =====
-    if (body.action === "create_post") {
-      const title = (body.title || "").trim();
-      const postBody = (body.body || "").trim();
-      const room = (body.room || "").trim().slice(0, 30) || "자유";
-      if (!title || !postBody) {
-        return sendJson(res, { error: "제목과 내용을 모두 입력해주세요." }, 400);
-      }
-      if (title.length > 100) {
-        return sendJson(res, { error: "제목은 100자 이내로 써주세요." }, 400);
-      }
-      if (postBody.length > 2000) {
-        return sendJson(res, { error: "내용은 2000자 이내로 써주세요." }, 400);
-      }
-      const userRecord = await APP_KV.get("user:" + username);
-      const avatar = userRecord ? (JSON.parse(userRecord).avatar || "👤") : "👤";
-      const listRaw = await APP_KV.get("posts");
-      const list = listRaw ? JSON.parse(listRaw) : [];
-      const entry = {
-        id: nodeCrypto.randomUUID(), username, avatar, title, body: postBody, room,
-        createdAt: Date.now(), replies: []
-      };
-      list.unshift(entry);
-      const trimmed = list.slice(0, 300);
-      await APP_KV.put("posts", JSON.stringify(trimmed));
-      return sendJson(res, { success: true, id: entry.id }, 200);
-    }
-
-    // ===== 커뮤니티: 목록 보기 =====
-    if (body.action === "list_posts") {
-      const listRaw = await APP_KV.get("posts");
-      const list = listRaw ? JSON.parse(listRaw) : [];
-      return sendJson(res, { success: true, posts: list.slice(0, 50) }, 200);
-    }
-
-    // ===== 커뮤니티: 글 삭제 (본인 글만) =====
-    if (body.action === "delete_post") {
-      const listRaw = await APP_KV.get("posts");
-      const list = listRaw ? JSON.parse(listRaw) : [];
-      const target = list.find(p => p.id === body.postId);
-      if (!target) {
-        return sendJson(res, { error: "이미 삭제된 글이에요." }, 404);
-      }
-      if (target.username !== username) {
-        return sendJson(res, { error: "본인이 쓴 글만 삭제할 수 있어요." }, 403);
-      }
-      const filtered = list.filter(p => p.id !== body.postId);
-      await APP_KV.put("posts", JSON.stringify(filtered));
-      return sendJson(res, { success: true }, 200);
-    }
-
-    // ===== 커뮤니티: 답글 달기 =====
-    if (body.action === "reply_to_post") {
-      const replyBody = (body.body || "").trim();
-      if (!replyBody) {
-        return sendJson(res, { error: "답글 내용을 입력해주세요." }, 400);
-      }
-      if (replyBody.length > 1000) {
-        return sendJson(res, { error: "답글은 1000자 이내로 써주세요." }, 400);
-      }
-      const userRecord = await APP_KV.get("user:" + username);
-      const avatar = userRecord ? (JSON.parse(userRecord).avatar || "👤") : "👤";
-      const listRaw = await APP_KV.get("posts");
-      const list = listRaw ? JSON.parse(listRaw) : [];
-      const target = list.find(p => p.id === body.postId);
-      if (!target) {
-        return sendJson(res, { error: "글을 찾을 수 없어요." }, 404);
-      }
-      if (!target.replies) target.replies = [];
-      target.replies.push({ id: nodeCrypto.randomUUID(), username, avatar, body: replyBody, createdAt: Date.now() });
-      await APP_KV.put("posts", JSON.stringify(list));
-      return sendJson(res, { success: true }, 200);
-    }
-
-    // ===== 커뮤니티: 답글 삭제 (본인 답글만) =====
-    if (body.action === "delete_reply") {
-      const listRaw = await APP_KV.get("posts");
-      const list = listRaw ? JSON.parse(listRaw) : [];
-      const target = list.find(p => p.id === body.postId);
-      if (!target || !target.replies) {
-        return sendJson(res, { error: "글을 찾을 수 없어요." }, 404);
-      }
-      const reply = target.replies.find(r => r.id === body.replyId);
-      if (!reply) {
-        return sendJson(res, { error: "이미 삭제된 답글이에요." }, 404);
-      }
-      if (reply.username !== username) {
-        return sendJson(res, { error: "본인이 쓴 답글만 삭제할 수 있어요." }, 403);
-      }
-      target.replies = target.replies.filter(r => r.id !== body.replyId);
-      await APP_KV.put("posts", JSON.stringify(list));
-      return sendJson(res, { success: true }, 200);
-    }
-
-    // ===== 커뮤니티: 신고 (제작자가 수동으로 검토) =====
-    if (body.action === "report_content") {
-      const reason = (body.reason || "").trim().slice(0, 500);
-      const key = "report:" + Date.now() + "-" + nodeCrypto.randomUUID().slice(0, 8);
-      await APP_KV.put(key, JSON.stringify({
-        reportedBy: username,
-        postId: body.postId || null,
-        replyId: body.replyId || null,
-        reason,
-        reportedAt: Date.now()
-      }));
-      return sendJson(res, { success: true }, 200);
-    }
-
-    // ===== 아이디 변경 (찜/기록/과제/게시글까지 함께 옮긴다) =====
+    // ===== 아이디 변경 (찜/기록/과제까지 함께 옮긴다) =====
     if (body.action === "change_username") {
       const newUsername = (body.newUsername || "").trim();
       const currentPassword = body.currentPassword || "";
@@ -679,17 +536,6 @@ async function handleAction(body, req, res) {
         await APP_KV.put("oauth:" + userObj.oauthProvider + ":" + userObj.oauthId, newUsername);
       }
 
-      const postsRaw = await APP_KV.get("posts");
-      if (postsRaw) {
-        const posts = JSON.parse(postsRaw);
-        posts.forEach(p => {
-          if (p.username === username) p.username = newUsername;
-          (p.replies || []).forEach(r => {
-            if (r.username === username) r.username = newUsername;
-          });
-        });
-        await APP_KV.put("posts", JSON.stringify(posts));
-      }
 
       // 다른 기기에 남아있는 세션들도 새 아이디를 가리키게 한다.
       // 안 그러면 그 기기들은 사라진 옛 아이디로 요청하게 된다.
@@ -967,7 +813,7 @@ async function handleAction(body, req, res) {
       const userUsageKey = "usage:" + username + ":" + today;
       const used = parseInt((await APP_KV.get(userUsageKey)) || "0", 10);
       const limit = plan === "paid" ? PAID_DAILY_LIMIT : FREE_DAILY_LIMIT;
-      return sendJson(res, { success: true, plan, used, limit, remaining: Math.max(0, limit - used), createdAt: userObj.createdAt || null, avatar: userObj.avatar || "👤" }, 200);
+      return sendJson(res, { success: true, plan, used, limit, remaining: Math.max(0, limit - used), createdAt: userObj.createdAt || null }, 200);
     }
 
     // ===== 사용량 1회 차감 =====
@@ -984,49 +830,6 @@ async function handleAction(body, req, res) {
         return sendJson(res, { error: "오늘 사용 횟수를 다 쓰셨어요. 내일 다시 이용해주세요.", plan, limitReached: true }, 429);
       }
       return sendJson(res, { success: true, used, limit, remaining: Math.max(0, limit - used) }, 200);
-    }
-
-    // ===== 뉴스 기사 찾기 (네이버 검색 API) =====
-    // Claude에게 "검색해서 찾아봐"라고 시키면 검색 결과 본문이 통째로 입력 토큰에 실려서
-    // 뉴스 탭 하나가 110원쯤 나간다. 대신 네이버가 기사 제목·요약·링크를 공짜로 주니까
-    // 그걸 받아서 Claude에게는 "이 중에서 골라 정리해줘"만 시킨다. 링크가 진짜라는 보장도 생긴다.
-    // 키가 없으면 {available:false}를 돌려주고, 프론트가 예전 방식으로 알아서 넘어간다.
-    if (body.action === "news_search") {
-      const cid = process.env.NAVER_SEARCH_CLIENT_ID, csec = process.env.NAVER_SEARCH_CLIENT_SECRET;
-      if (!cid || !csec) return sendJson(res, { available: false, items: [] }, 200);
-      const q = String(body.query || "").trim().slice(0, 80);
-      if (!q) return sendJson(res, { error: "검색어가 비어 있어요." }, 400);
-      const nkey = "news:" + nodeCrypto.createHash("sha256").update(q).digest("hex").slice(0, 32);
-      const hit = await APP_KV.get(nkey);
-      if (hit) { res.status(200).type("application/json").send(hit); return; }
-      try {
-        // 1순위: NAVER API HUB(네이버 클라우드). 키가 HUB 것이 아니면 401/403/404가 나니 그때만 옛 주소로 한 번 더.
-        const qs = "?display=8&sort=sim&query=" + encodeURIComponent(q);
-        let r = await fetch("https://naverapihub.apigw.ntruss.com/search/v1/news" + qs + "&format=json", {
-          headers: { "X-NCP-APIGW-API-KEY-ID": cid, "X-NCP-APIGW-API-KEY": csec }
-        });
-        if (r.status === 401 || r.status === 403 || r.status === 404) {
-          r = await fetch("https://openapi.naver.com/v1/search/news.json" + qs, {
-            headers: { "X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec }
-          });
-        }
-        if (!r.ok) {
-          console.error("naver news_search failed:", r.status);
-          return sendJson(res, { available: false, items: [], error: "naver " + r.status }, 200);
-        }
-        const data = await r.json();
-        const strip = t => String(t || "").replace(/<[^>]+>/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#39;/g, "'");
-        const items = (data.items || []).map(it => ({
-          title: strip(it.title), summary: strip(it.description),
-          link: it.originallink || it.link || "", date: String(it.pubDate || "").slice(0, 16)
-        })).filter(it => it.title && /^https?:\/\//.test(it.link)).slice(0, 6);
-        const payload = JSON.stringify({ available: true, items });
-        await APP_KV.put(nkey, payload, { expirationTtl: 60 * 60 * 24 * 3 });   // 같은 검색어는 3일 재사용
-        res.status(200).type("application/json").send(payload);
-      } catch (err) {
-        return sendJson(res, { available: false, items: [], error: err.message }, 200);
-      }
-      return;
     }
 
     // ===== 이번 달 토큰 사용량과 예상 요금 =====
