@@ -21,9 +21,27 @@ const nodeCrypto = require("crypto");
 const subtle = nodeCrypto.webcrypto.subtle;
 const getRandomValues = nodeCrypto.webcrypto.getRandomValues.bind(nodeCrypto.webcrypto);
 
-const FREE_DAILY_LIMIT = 30;
-const PAID_DAILY_LIMIT = 300;
+// ===== 씨앗(코인) =====
+// 이용권(회수권)·로드맵 이용권을 따로 팔지 않고 화폐 하나("씨앗", 코드에선 coins)로 통일한다.
+// 10,000원 = 100코인. 주제 하나(탭 전부)가 10코인 = 1,000원이고 원가가 150~250원이라
+// 가장 비싼 경우에도 7할이 남는다. 로드맵은 원가 100원쯤이지만 "큰 걸 받는 느낌"이라 같은 10코인.
+const COIN_COSTS = {
+  topic: 10,      // 주제 추천받기 (심화 주제로 다시 받기 포함)
+  mytopic: 10,    // 내 주제로 찾기
+  fill: 10,       // 옛 저장 주제의 나머지 탭 채우기
+  roadmap: 10,    // 생기부 로드맵 1개
+  linked: 5,      // 탐구 연계하기
+  interview: 3,   // 면접 예상 질문
+  formula: 2      // 수식·그래프 (탐구내용 아래 버튼)
+};
+const SIGNUP_COINS = 20;          // 가입하면 주는 씨앗 (= 로드맵 1개 + 주제 1개). 2026-10-31 30→20으로 낮춤
+const USER_DAILY_ACTION_CAP = 60; // 코인이 있어도 하루에 이 이상은 못 돌린다 (남용 방지)
 const GLOBAL_DAILY_LIMIT = 1000;
+const COIN_PACKS = [
+  { coins: 50,  price: 5500 },
+  { coins: 100, price: 10000 },
+  { coins: 300, price: 27000 }
+];
 
 const PAGES_URL = process.env.PAGES_URL || "https://lingering-sun-b4f9.stopn1.workers.dev";
 const BACKEND_URL = process.env.BACKEND_URL || "https://signet-kswi.onrender.com";
@@ -32,6 +50,24 @@ const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
+
+// ===== 코인 장부 =====
+async function ensureCoins(username) {
+  const key = "coins:" + username;
+  // 없을 때만 가입 코인을 넣는다 (NX). 이미 있으면 아무 일도 안 한다.
+  const created = await redis.set(key, SIGNUP_COINS, { nx: true });
+  if (created) await logCoins(username, "signup", SIGNUP_COINS, SIGNUP_COINS);
+  const v = await redis.get(key);
+  const n = parseInt(v == null ? "0" : String(v), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+async function logCoins(username, kind, delta, after, memo) {
+  try {
+    const key = "coinlog:" + username;
+    await redis.lpush(key, JSON.stringify({ t: Date.now(), kind, delta, after, memo: memo || "" }));
+    await redis.ltrim(key, 0, 49);
+  } catch (e) { /* 내역은 참고용이라 실패해도 본 작업은 진행 */ }
+}
 
 // Cloudflare KV랑 똑같이 쓸 수 있도록 만든 얇은 래퍼 (get/put/delete)
 const APP_KV = {
@@ -94,7 +130,7 @@ const DEFAULT_MODEL = "claude-sonnet-5";
 // 그보다 약간 여유를 둔 상한으로 자른다.
 const MAX_TOKENS_CAP = 8000;
 // 사용자 1명이 하루에 보낼 수 있는 원시 AI 호출 수.
-// "생성 버튼 1번"이 내부적으로 4~6번 호출되므로, 버튼 한도(FREE_DAILY_LIMIT)에
+// "생성 버튼 1번"이 내부적으로 4~6번 호출되므로, 하루 동작 상한(USER_DAILY_ACTION_CAP)에
 // 넉넉히 곱한 값으로 잡는다. 정상 사용으로는 닿지 않고, 스크립트 악용만 걸린다.
 const RAW_CALL_DAILY_CAP = parseInt(process.env.RAW_CALL_DAILY_CAP || "250", 10);
 
@@ -321,6 +357,8 @@ async function handleAction(body, req, res) {
         "assign:" + username,
         "roadmap:" + username,
         "roadmaps:" + username,
+        "coins:" + username,
+        "coinlog:" + username,
         "usage:" + username + ":" + todayForDelete,
         "apicalls:" + username + ":" + todayForDelete,
         "user:" + username,
@@ -510,7 +548,7 @@ async function handleAction(body, req, res) {
       }
       await APP_KV.delete("user:" + username);
 
-      for (const prefix of ["fav:", "hist:", "assign:", "roadmap:", "roadmaps:"]) {
+      for (const prefix of ["fav:", "hist:", "assign:", "roadmap:", "roadmaps:", "coins:", "coinlog:"]) {
         const dataRaw = await APP_KV.get(prefix + username);
         if (dataRaw) {
           await APP_KV.put(prefix + newUsername, dataRaw);
@@ -804,32 +842,64 @@ async function handleAction(body, req, res) {
       return sendJson(res, { success: true }, 200);
     }
 
-    // ===== 사용량 조회 =====
+    // ===== 코인 잔액 조회 =====
+    // 코인 키가 없으면(가입 직후, 또는 코인 제도 전에 가입한 계정) 가입 코인을 한 번만 넣는다.
+    // SET NX라 동시에 두 번 불려도 두 번 들어가지 않는다.
     if (body.action === "get_usage") {
       const userRecord = await APP_KV.get("user:" + username);
       const userObj = userRecord ? JSON.parse(userRecord) : {};
-      const plan = userObj.plan || "free";
-      const today = new Date().toISOString().slice(0, 10);
-      const userUsageKey = "usage:" + username + ":" + today;
-      const used = parseInt((await APP_KV.get(userUsageKey)) || "0", 10);
-      const limit = plan === "paid" ? PAID_DAILY_LIMIT : FREE_DAILY_LIMIT;
-      return sendJson(res, { success: true, plan, used, limit, remaining: Math.max(0, limit - used), createdAt: userObj.createdAt || null }, 200);
+      const coins = await ensureCoins(username);
+      return sendJson(res, { success: true, coins, costs: COIN_COSTS, packs: COIN_PACKS, signupCoins: SIGNUP_COINS, createdAt: userObj.createdAt || null, plan: userObj.plan || "free" }, 200);
     }
 
-    // ===== 사용량 1회 차감 =====
+    // ===== 코인 차감 =====
+    // 어떤 기능인지(kind)에 따라 값이 다르다. DECRBY가 원자적이라 탭 두 개에서 동시에 눌러도
+    // 정확히 두 번 빠지고, 음수가 되면 바로 되돌리고 거절한다.
     if (body.action === "consume_usage") {
-      const userRecord = await APP_KV.get("user:" + username);
-      const plan = userRecord ? (JSON.parse(userRecord).plan || "free") : "free";
+      const kind = String(body.kind || "topic");
+      const cost = COIN_COSTS[kind] != null ? COIN_COSTS[kind] : COIN_COSTS.topic;
       const today = new Date().toISOString().slice(0, 10);
-      const userUsageKey = "usage:" + username + ":" + today;
-      const limit = plan === "paid" ? PAID_DAILY_LIMIT : FREE_DAILY_LIMIT;
-      // 여기도 원자적 증가로 바꿨다. 예전 방식(읽고→+1→쓰기)은 탭 두 개에서 동시에
-      // 누르면 한 번만 차감되어 한도를 넘겨 쓸 수 있었다.
-      const used = await APP_KV.incr(userUsageKey, 172800);
-      if (used > limit) {
-        return sendJson(res, { error: "오늘 사용 횟수를 다 쓰셨어요. 내일 다시 이용해주세요.", plan, limitReached: true }, 429);
+      const dayCount = await APP_KV.incr("usage:" + username + ":" + today, 172800);
+      if (dayCount > USER_DAILY_ACTION_CAP) {
+        return sendJson(res, { error: "오늘은 여기까지만 돌릴 수 있어요. 내일 다시 이용해주세요.", limitReached: true }, 429);
       }
-      return sendJson(res, { success: true, used, limit, remaining: Math.max(0, limit - used) }, 200);
+      await ensureCoins(username);
+      const after = await redis.decrby("coins:" + username, cost);
+      if (after < 0) {
+        await redis.incrby("coins:" + username, cost);
+        return sendJson(res, { error: "씨앗이 부족해요. (필요 " + cost + "개, 가진 " + (after + cost) + "개)", limitReached: true, coins: after + cost, need: cost }, 402);
+      }
+      await logCoins(username, kind, -cost, after);
+      return sendJson(res, { success: true, coins: after, cost, kind }, 200);
+    }
+
+    // ===== 코인 내역 (최근 50건) =====
+    if (body.action === "coin_log") {
+      const raw = (await redis.lrange("coinlog:" + username, 0, 49)) || [];
+      const items = raw.map(x => { try { return typeof x === "string" ? JSON.parse(x) : x; } catch (e) { return null; } }).filter(Boolean);
+      return sendJson(res, { success: true, items, coins: await ensureCoins(username) }, 200);
+    }
+
+    // ===== 코인 지급 (관리자) =====
+    // 결제가 붙기 전에는 테스터·학원에 이걸로 넣어준다. Render 환경변수 ADMIN_KEY가 있어야 작동.
+    // 예: {"action":"grant_coins","adminKey":"…","target":"아이디","amount":100,"memo":"테스터"}
+    if (body.action === "grant_coins") {
+      const adminKey = process.env.ADMIN_KEY || "";
+      if (!adminKey || body.adminKey !== adminKey) {
+        return sendJson(res, { error: "권한이 없어요." }, 403);
+      }
+      const target = String(body.target || "").trim();
+      const amount = parseInt(body.amount, 10);
+      if (!target || !Number.isFinite(amount) || amount === 0 || Math.abs(amount) > 100000) {
+        return sendJson(res, { error: "대상 아이디와 코인 수(0이 아닌 정수)를 적어주세요." }, 400);
+      }
+      if (!(await APP_KV.get("user:" + target))) {
+        return sendJson(res, { error: "그런 아이디가 없어요." }, 404);
+      }
+      await ensureCoins(target);
+      const after = await redis.incrby("coins:" + target, amount);
+      await logCoins(target, "grant", amount, after, String(body.memo || "").slice(0, 60));
+      return sendJson(res, { success: true, target, coins: after }, 200);
     }
 
     // ===== 이번 달 토큰 사용량과 예상 요금 =====
